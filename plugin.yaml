@@ -1,7 +1,7 @@
 name: nextcloud-talk
 label: Nextcloud Talk
 kind: platform
-version: 1.1.0
+version: 1.1.1
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -75,6 +75,13 @@ optional_env:
   - name: NEXTCLOUD_TALK_MAX_ROOMS
     description: "User mode: maximum concurrent per-room long-poll tasks (default 20)"
     prompt: "Max concurrent rooms (user mode)"
+    password: false
+  - name: NEXTCLOUD_TALK_LONG_POLL_TIMEOUT
+    description: >-
+      User mode: server-side long-poll hold time in seconds (default 25;
+      Talk's own ceiling is 30). Lower this if something in front of
+      Hermes has its own shorter read/proxy timeout.
+    prompt: "Long-poll timeout seconds (user mode, default 25)"
     password: false
   # -- Shared --
   - name: NEXTCLOUD_TALK_MODE
