@@ -49,6 +49,12 @@ Environment variables (env wins over config.yaml ``extra``):
                                              over with the next message this account does
                                              answer, so "mention" mode still has context from
                                              what it skipped (default 40; 0 disables)
+    NEXTCLOUD_TALK_LONG_POLL_TIMEOUT       Server-side long-poll hold time in seconds (default
+                                             25; Talk's own ceiling is 30 -- lower this if
+                                             something in front of Hermes has its own shorter
+                                             read/proxy timeout, since a poll that doesn't return
+                                             before that boundary is an error rather than a plain
+                                             "nothing new")
 
 Active listening and the agent-to-agent loop guard only matter in a room
 with more than one participant (DMs are always addressed to this account,
@@ -87,7 +93,16 @@ DEFAULT_DISPLAY_NAME = "Hermes"
 MAX_MESSAGE_LENGTH = 32000  # Nextcloud Talk chat message cap
 DEFAULT_DISCOVERY_INTERVAL = 30.0
 DEFAULT_MAX_ROOMS = 20
-LONG_POLL_TIMEOUT = 30  # server-side seconds; Talk holds the request open
+LONG_POLL_TIMEOUT_ENV = "NEXTCLOUD_TALK_LONG_POLL_TIMEOUT"
+# Server-side seconds Talk holds a long-poll request open before returning 304.
+# Talk itself allows up to 30. Anything sitting in front of Hermes with its own
+# proxy/gateway read timeout under ~30s (a reverse proxy, a load balancer, some
+# PaaS platforms) turns every idle poll into an error at that boundary, so the
+# default here is a few seconds under Talk's own ceiling; override with
+# NEXTCLOUD_TALK_LONG_POLL_TIMEOUT if your front door's timeout is different
+# (or set it back to 30 if nothing sits in front of Hermes).
+DEFAULT_LONG_POLL_TIMEOUT = 25
+LONG_POLL_TIMEOUT = int(os.getenv(LONG_POLL_TIMEOUT_ENV, DEFAULT_LONG_POLL_TIMEOUT))
 BASELINE_LOOKUP_LIMIT = 1
 DEDUP_MAX_SIZE = 2000
 DEDUP_WINDOW_SECONDS = 600

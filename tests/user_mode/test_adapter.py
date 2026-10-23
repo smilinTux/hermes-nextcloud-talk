@@ -16,14 +16,19 @@ see ``tests/stubs/gateway/platforms/base.py``).
 
 import asyncio
 import base64
+import importlib
+import os
 
 import pytest
 
 from unittest.mock import AsyncMock, MagicMock
 
+import user.adapter as user_adapter
 from user.adapter import (
     DEFAULT_AGENT_CHAIN_LIMIT,
+    DEFAULT_LONG_POLL_TIMEOUT,
     DEFAULT_WORKING_REACTION_EMOJI,
+    LONG_POLL_TIMEOUT_ENV,
     MAX_MESSAGE_LENGTH,
     ROOM_MODE_FREE,
     ROOM_MODE_MENTION,
@@ -620,3 +625,42 @@ def test_room_description_is_not_applied_in_dms():
 
     assert len(adapter.handled_events) == 1
     assert adapter.handled_events[0].text == "hello"
+
+
+# -- Long-poll timeout (module-level, read from env at import time) --------
+
+
+def _reload_adapter_with_env(value):
+    """Reload ``user.adapter`` with NEXTCLOUD_TALK_LONG_POLL_TIMEOUT set (or
+    unset for ``value is None``), returning the resulting LONG_POLL_TIMEOUT.
+    Always restores the prior env state and reloads back to it afterwards,
+    so this module's own globals are unaffected for the rest of the suite.
+    """
+    had_prior = LONG_POLL_TIMEOUT_ENV in os.environ
+    prior = os.environ.get(LONG_POLL_TIMEOUT_ENV)
+    try:
+        if value is None:
+            os.environ.pop(LONG_POLL_TIMEOUT_ENV, None)
+        else:
+            os.environ[LONG_POLL_TIMEOUT_ENV] = value
+        importlib.reload(user_adapter)
+        return user_adapter.LONG_POLL_TIMEOUT
+    finally:
+        if had_prior:
+            os.environ[LONG_POLL_TIMEOUT_ENV] = prior
+        else:
+            os.environ.pop(LONG_POLL_TIMEOUT_ENV, None)
+        importlib.reload(user_adapter)
+
+
+def test_long_poll_timeout_defaults_to_25_under_talks_own_30s_ceiling():
+    assert DEFAULT_LONG_POLL_TIMEOUT == 25
+    assert _reload_adapter_with_env(None) == 25
+
+
+def test_long_poll_timeout_honors_env_override():
+    assert _reload_adapter_with_env("12") == 12
+
+
+def test_long_poll_timeout_can_be_restored_to_talks_own_ceiling():
+    assert _reload_adapter_with_env("30") == 30

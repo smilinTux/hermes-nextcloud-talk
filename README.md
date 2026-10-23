@@ -129,6 +129,18 @@ to the next message handed to the agent as "room rules". Editing the
 description in Talk itself -- no config change, no restart -- changes the
 agent's instructions for that room on its very next reply.
 
+### Long-poll timeout behind a reverse proxy (user mode)
+
+Each room's long-poll request asks Nextcloud Talk to hold it open for up
+to `NEXTCLOUD_TALK_LONG_POLL_TIMEOUT` seconds (default `25`; Talk's own
+ceiling is `30`) before returning "nothing new". If Hermes sits behind a
+reverse proxy, load balancer, or PaaS ingress with its own read timeout
+shorter than Talk's hold time, an idle poll that doesn't get a response
+before *that* timeout comes back as a connection error instead of a plain
+304 -- which this adapter already retries, but needlessly. Set
+`NEXTCLOUD_TALK_LONG_POLL_TIMEOUT` a few seconds under your front door's
+timeout (or raise it back to `30` if nothing sits in front of Hermes).
+
 ### Federation (user mode)
 
 Nextcloud Talk supports inviting a user on another federated server into

@@ -1,7 +1,7 @@
 name: nextcloud-talk-user
 label: Nextcloud Talk (user account)
 kind: platform
-version: 1.1.0
+version: 1.1.1
 description: >
   Nextcloud Talk real-user adapter for Hermes Agent. The agent authenticates
   as a genuine Nextcloud account (an app password, not a webhook bot),
@@ -61,6 +61,13 @@ optional_env:
   - name: NEXTCLOUD_TALK_MAX_ROOMS
     description: "Maximum concurrent per-room long-poll tasks (default 20)"
     prompt: "Max concurrent rooms"
+    password: false
+  - name: NEXTCLOUD_TALK_LONG_POLL_TIMEOUT
+    description: >-
+      Server-side long-poll hold time in seconds (default 25; Talk's own
+      ceiling is 30). Lower this if something in front of Hermes has its
+      own shorter read/proxy timeout.
+    prompt: "Long-poll timeout seconds (default 25)"
     password: false
   - name: NEXTCLOUD_TALK_WORKING_REACTION
     description: >-

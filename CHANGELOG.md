@@ -4,6 +4,17 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.1.1] - 2026-10-23
+
+### Fixed (user mode)
+
+- The per-room long-poll's server-side hold time is now configurable
+  (`NEXTCLOUD_TALK_LONG_POLL_TIMEOUT`, default `25`) instead of a hardcoded
+  `30`. Default lowered a few seconds under Nextcloud Talk's own `30`
+  ceiling so a deployment behind a reverse proxy, load balancer, or PaaS
+  ingress with a shorter read timeout doesn't turn every idle poll into a
+  connection error at that boundary.
+
 ## [1.1.0] - 2026-10-23
 
 ### Added (user mode)
