@@ -1,14 +1,16 @@
 name: nextcloud-talk-bot
 label: Nextcloud Talk (webhook bot)
 kind: platform
-version: 0.3.0
+version: 0.4.0
 description: >-
   Nextcloud Talk webhook bot adapter for Hermes Agent. Installed as a
   drop-in plugin (ctx.register_platform). Posts a visible working-signal
   reaction (default eyes emoji) on the triggering message while a turn is
-  in flight, since Talk bots cannot show typing. This manifest is for a
-  standalone deployment of this directory only; the combined repo's root
-  plugin.yaml covers both modes in one install.
+  in flight, since Talk bots cannot show typing. Inbound admission is
+  hardened with an explicit 1 MiB body cap and a nonce-replay cache ahead
+  of payload parsing. This manifest is for a standalone deployment of this
+  directory only; the combined repo's root plugin.yaml covers both modes
+  in one install.
 author: "Hermes Nextcloud Talk contributors"
 requires_env:
   - name: NEXTCLOUD_TALK_SECRET

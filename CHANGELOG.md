@@ -4,6 +4,25 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.2.0] - 2026-10-23
+
+### Added (bot mode)
+
+- Explicit inbound webhook hardening: a named 1 MiB body-size cap
+  (`MAX_WEBHOOK_BODY_BYTES`) and a bounded, TTL-based nonce-replay cache
+  checked immediately after signature verification, before any payload
+  parsing. A byte-for-byte replay of a previously-accepted signed request
+  is now rejected outright (`409`) instead of only being caught later, and
+  only for `Create` events, by message-id dedup.
+- Hardening ported from
+  [Cliff3c/hermes-nextcloud-talk](https://github.com/Cliff3c/hermes-nextcloud-talk)
+  (MIT) -- reimplemented against this repo's own structure and naming, not
+  copied. See `THIRD_PARTY.md` and the module docstring in
+  `bot/adapter.py` for what was ported, what was deliberately left out
+  (the DTD-hardened XML parse of the outbound send response, which this
+  adapter's `_post_message` has no equivalent of, since it never parses
+  that response body), and why.
+
 ## [1.1.1] - 2026-10-23
 
 ### Fixed (user mode)
