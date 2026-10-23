@@ -7,10 +7,14 @@ during development instead. These tests cover every pure helper: auth
 header construction, mention detection (rich + plain-text, including
 federated actor ids), room-mode resolution (display-name override vs. env
 map vs. default), DM classification, federation-invite allowlisting,
-message chunking at the Talk 32000-char limit, and the memory source-tag
-format.
+message chunking at the Talk 32000-char limit, the memory source-tag
+format, the agent-to-agent loop guard, active-listening context, and
+room-description rules -- plus end-to-end ``_on_message`` behavior tests
+for the last three (no network: ``handle_message`` is a recording stub,
+see ``tests/stubs/gateway/platforms/base.py``).
 """
 
+import asyncio
 import base64
 
 import pytest
@@ -18,6 +22,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from user.adapter import (
+    DEFAULT_AGENT_CHAIN_LIMIT,
     DEFAULT_WORKING_REACTION_EMOJI,
     MAX_MESSAGE_LENGTH,
     ROOM_MODE_FREE,
@@ -32,15 +37,20 @@ from user.adapter import (
     _chunk_message,
     _extract_actor,
     _invite_accept_path,
+    _is_agent_actor,
     _is_mention,
     _is_pending_invite,
     _is_skippable_room,
     _ocs_headers,
+    _parse_agent_users,
     _parse_room_modes_env,
     _room_chat_type,
     _room_mode,
     _should_auto_accept_invite,
     _source_tag,
+    _trim_backlog,
+    _with_room_context,
+    _with_room_rules,
     _working_reaction_emoji,
 )
 from gateway.config import PlatformConfig
@@ -358,8 +368,7 @@ def test_on_processing_start_adds_configured_reaction():
         source=MagicMock(chat_id="tok1"), message_id="42",
     )
 
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(adapter.on_processing_start(event))
+    asyncio.run(adapter.on_processing_start(event))
 
     adapter._add_reaction.assert_awaited_once_with("tok1", "42", DEFAULT_WORKING_REACTION_EMOJI)
 
@@ -372,10 +381,7 @@ def test_on_processing_complete_removes_configured_reaction():
         source=MagicMock(chat_id="tok1"), message_id="42",
     )
 
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(
-        adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
-    )
+    asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
 
     adapter._remove_reaction.assert_awaited_once_with("tok1", "42", DEFAULT_WORKING_REACTION_EMOJI)
 
@@ -388,8 +394,7 @@ def test_on_processing_start_noop_when_reaction_disabled():
         source=MagicMock(chat_id="tok1"), message_id="42",
     )
 
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(adapter.on_processing_start(event))
+    asyncio.run(adapter.on_processing_start(event))
 
     adapter._add_reaction.assert_not_awaited()
 
@@ -402,7 +407,216 @@ def test_on_processing_start_noop_without_message_id():
         source=MagicMock(chat_id="tok1"), message_id=None,
     )
 
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(adapter.on_processing_start(event))
+    asyncio.run(adapter.on_processing_start(event))
 
     adapter._add_reaction.assert_not_awaited()
+
+
+# -- Agent-to-agent loop guard: pure helpers --------------------------------
+
+
+def test_parse_agent_users_splits_and_lowercases():
+    assert _parse_agent_users("Ops-Bot, Research-Bot ") == {"ops-bot", "research-bot"}
+
+
+def test_parse_agent_users_empty_is_empty_set():
+    assert _parse_agent_users("") == frozenset()
+    assert _parse_agent_users(None) == frozenset()
+
+
+def test_is_agent_actor_bot_type_always_true():
+    assert _is_agent_actor({"type": "bots", "id": "anything"}, frozenset()) is True
+
+
+def test_is_agent_actor_bare_id_matches_listed_agent():
+    assert _is_agent_actor({"type": "users", "id": "ops-bot"}, frozenset({"ops-bot"})) is True
+
+
+def test_is_agent_actor_bare_id_matches_federated_qualified_form():
+    agent_users = frozenset({"ops-bot"})
+    actor = {"type": "federated_users", "id": "ops-bot@remote.example"}
+    assert _is_agent_actor(actor, agent_users) is True
+
+
+def test_is_agent_actor_unlisted_human_is_not_an_agent():
+    assert _is_agent_actor({"type": "users", "id": "alice"}, frozenset({"ops-bot"})) is False
+
+
+def test_is_agent_actor_empty_id_is_not_an_agent():
+    assert _is_agent_actor({"type": "users", "id": ""}, frozenset({"ops-bot"})) is False
+
+
+# -- Active listening / room context: pure helpers --------------------------
+
+
+def test_with_room_context_no_backlog_is_passthrough():
+    assert _with_room_context("hello", []) == "hello"
+
+
+def test_with_room_context_prefixes_backlog_and_keeps_addressed_message():
+    out = _with_room_context("what do you think?", ["alice: hi", "bob: anyone around?"])
+    assert "2 line(s)" in out
+    assert "alice: hi" in out
+    assert "bob: anyone around?" in out
+    assert out.endswith("[The message addressed to you]\nwhat do you think?")
+
+
+def test_with_room_rules_no_description_is_passthrough():
+    assert _with_room_rules("hello", None) == "hello"
+    assert _with_room_rules("hello", "   ") == "hello"
+
+
+def test_with_room_rules_prefixes_description():
+    out = _with_room_rules("hello", "Keep replies under 3 sentences.")
+    assert out.startswith("[Room rules")
+    assert "Keep replies under 3 sentences." in out
+    assert out.endswith("\n\nhello")
+
+
+def test_trim_backlog_caps_by_message_count():
+    backlog = [f"line {i}" for i in range(10)]
+    trimmed = _trim_backlog(backlog, max_messages=3)
+    assert trimmed == ["line 7", "line 8", "line 9"]
+
+
+def test_trim_backlog_zero_max_clears_everything():
+    assert _trim_backlog(["a", "b"], max_messages=0) == []
+
+
+def test_trim_backlog_caps_by_total_chars():
+    backlog = ["x" * 5000, "y" * 5000]
+    trimmed = _trim_backlog(backlog, max_messages=10)
+    assert trimmed == ["y" * 5000]
+
+
+# -- _on_message end-to-end: agent loop guard, active listening, room rules -
+
+
+def _talk_message(msg_id, actor_id, text, *, actor_type="users", display_name=None, params=None):
+    return {
+        "id": msg_id,
+        "actorId": actor_id,
+        "actorType": actor_type,
+        "actorDisplayName": display_name or actor_id,
+        "message": text,
+        "messageType": "comment",
+        "messageParameters": params or {},
+        "timestamp": 1700000000,
+    }
+
+
+def _free_group_room(token, *, description=None):
+    return {
+        "token": token,
+        "type": ROOM_TYPE_GROUP,
+        "displayName": "[free] room",
+        "description": description,
+    }
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_agent_message_in_free_room_without_mention_is_not_forwarded():
+    adapter = _make_adapter(agent_users="ops-bot")
+    adapter._room_meta["tok1"] = _free_group_room("tok1")
+
+    _run(adapter._on_message("tok1", _talk_message("1", "ops-bot", "hey team, status?")))
+
+    assert adapter.handled_events == []
+
+
+def test_agent_message_in_free_room_with_mention_is_forwarded():
+    adapter = _make_adapter(agent_users="ops-bot")
+    adapter._room_meta["tok1"] = _free_group_room("tok1")
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+
+    _run(adapter._on_message("tok1", _talk_message("1", "ops-bot", "@hermes-bot status?", params=params)))
+
+    assert len(adapter.handled_events) == 1
+
+
+def test_agent_chain_limit_silences_agent_until_a_human_speaks():
+    adapter = _make_adapter(agent_users="ops-bot", agent_chain_limit=2)
+    adapter._room_meta["tok1"] = _free_group_room("tok1")
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+
+    for i in range(3):
+        _run(adapter._on_message("tok1", _talk_message(str(i), "ops-bot", "@hermes-bot ping", params=params)))
+    assert len(adapter.handled_events) == 2  # 3rd exceeds the limit (> 2), silenced
+
+    # A human message resets the chain counter.
+    _run(adapter._on_message("tok1", _talk_message("human-1", "alice", "@hermes-bot are you there?", params=params)))
+    assert len(adapter.handled_events) == 3
+
+    _run(adapter._on_message("tok1", _talk_message("4", "ops-bot", "@hermes-bot ping", params=params)))
+    assert len(adapter.handled_events) == 4
+
+
+def test_webhook_bot_actor_type_counts_as_agent_even_when_unlisted():
+    adapter = _make_adapter()  # no agent_users configured
+    adapter._room_meta["tok1"] = _free_group_room("tok1")
+
+    _run(adapter._on_message("tok1", _talk_message("1", "some-bot", "hey team", actor_type="bots")))
+
+    assert adapter.handled_events == []
+
+
+def test_mention_mode_remembers_unaddressed_messages_as_context():
+    adapter = _make_adapter(room_modes="tok1=mention")
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "team"}
+
+    _run(adapter._on_message("tok1", _talk_message("1", "alice", "anyone around?")))
+    assert adapter.handled_events == []  # not mentioned, remembered instead
+
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+    _run(adapter._on_message("tok1", _talk_message("2", "bob", "@hermes-bot status?", params=params)))
+
+    assert len(adapter.handled_events) == 1
+    event = adapter.handled_events[0]
+    assert "alice: anyone around?" in event.text
+    assert event.text.endswith("[The message addressed to you]\n@hermes-bot status?")
+    assert event.metadata["room_context_lines"] == 1
+    # The backlog is consumed, not replayed on the next addressed message.
+    _run(adapter._on_message("tok1", _talk_message("3", "bob", "@hermes-bot again?", params=params)))
+    assert "alice: anyone around?" not in adapter.handled_events[1].text
+
+
+def test_context_messages_zero_disables_active_listening():
+    adapter = _make_adapter(room_modes="tok1=mention", context_messages=0)
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "team"}
+
+    _run(adapter._on_message("tok1", _talk_message("1", "alice", "anyone around?")))
+
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+    _run(adapter._on_message("tok1", _talk_message("2", "bob", "@hermes-bot status?", params=params)))
+
+    assert len(adapter.handled_events) == 1
+    assert "anyone around?" not in adapter.handled_events[0].text
+
+
+def test_room_description_is_applied_as_rules_for_group_rooms():
+    adapter = _make_adapter()
+    adapter._room_meta["tok1"] = _free_group_room("tok1", description="Be brief.")
+
+    _run(adapter._on_message("tok1", _talk_message("1", "alice", "hello")))
+
+    assert len(adapter.handled_events) == 1
+    assert adapter.handled_events[0].text.startswith("[Room rules")
+    assert "Be brief." in adapter.handled_events[0].text
+
+
+def test_room_description_is_not_applied_in_dms():
+    adapter = _make_adapter()
+    adapter._room_meta["tok1"] = {
+        "token": "tok1",
+        "type": ROOM_TYPE_ONE_TO_ONE,
+        "displayName": "alice",
+        "description": "Be brief.",
+    }
+
+    _run(adapter._on_message("tok1", _talk_message("1", "alice", "hello")))
+
+    assert len(adapter.handled_events) == 1
+    assert adapter.handled_events[0].text == "hello"

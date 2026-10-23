@@ -93,6 +93,42 @@ See [`user/plugin.yaml`](./user/plugin.yaml) for every optional env var
 (room modes, federation inviter allowlist, discovery interval, reaction
 emoji, home channel for cron delivery).
 
+### Multi-agent rooms (user mode)
+
+Running more than one agent connected to the same Nextcloud server (each
+its own user-mode account) needs two extra things so a `free` room doesn't
+turn into an infinite agent-to-agent reply loop:
+
+- `NEXTCLOUD_TALK_AGENT_USERS` -- comma-separated Nextcloud user ids of the
+  *other* agents sharing the server (e.g. `ops-bot,research-bot`). A message from one
+  of these (or from any Talk webhook bot, detected by `actorType`) still
+  needs an explicit `@mention` of this account even in a `free` room --
+  "free" only means free for humans.
+- `NEXTCLOUD_TALK_AGENT_CHAIN_LIMIT` (default `6`) -- once an addressed
+  agent-to-agent exchange runs this many messages in a row with no human
+  message in between, this account stops answering that agent in that
+  room until a human speaks again. A bare id in `NEXTCLOUD_TALK_AGENT_USERS`
+  matches both the local user and the same id on any federated instance
+  (`ops-bot@remote-instance`); a qualified entry matches only that exact id.
+
+### Active listening (user mode)
+
+A message this account does not answer -- an un-mentioned message in a
+`mention`-mode room, or another agent not addressing it -- is not simply
+dropped. It is kept per room (`NEXTCLOUD_TALK_CONTEXT_MESSAGES`, default
+`40`; `0` disables this) and handed over as context with the next message
+this account does answer, so a reply in `mention` mode is informed by what
+the room has been saying, not just by the one line that named it. The
+backlog is consumed on use, not replayed on every subsequent reply.
+
+### Room rules from the room description (user mode)
+
+In any group room (not a DM), the room's Nextcloud Talk conversation
+*description* is read on every discovery pass and, if non-empty, prepended
+to the next message handed to the agent as "room rules". Editing the
+description in Talk itself -- no config change, no restart -- changes the
+agent's instructions for that room on its very next reply.
+
 ### Federation (user mode)
 
 Nextcloud Talk supports inviting a user on another federated server into
