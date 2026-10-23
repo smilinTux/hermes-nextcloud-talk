@@ -15,7 +15,7 @@ enough surface to import.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class MessageType(Enum):
@@ -50,6 +50,7 @@ class MessageEvent:
     channel_prompt: Optional[str] = None
     internal: bool = False
     timestamp: Any = field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -74,6 +75,11 @@ class BasePlatformAdapter:
         self._running = False
         self._background_tasks = set()
         self.handled_events: List[MessageEvent] = []
+
+    @property
+    def name(self) -> str:
+        """Short platform name used in adapter log lines (e.g. "[%s] ...", self.name)."""
+        return getattr(self.platform, "value", None) or str(self.platform)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""

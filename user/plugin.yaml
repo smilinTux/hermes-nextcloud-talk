@@ -1,7 +1,7 @@
 name: nextcloud-talk-user
 label: Nextcloud Talk (user account)
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: >
   Nextcloud Talk real-user adapter for Hermes Agent. The agent authenticates
   as a genuine Nextcloud account (an app password, not a webhook bot),
@@ -67,4 +67,22 @@ optional_env:
       Reaction added to a message while a turn is being processed and
       removed once it finishes (default: the eyes emoji; empty disables).
     prompt: "Working reaction (default eyes emoji, empty disables)"
+    password: false
+  - name: NEXTCLOUD_TALK_AGENT_USERS
+    description: >-
+      Comma-separated Nextcloud user ids of other agents sharing this
+      server; in a "free" room they still need an explicit @mention of
+      this account (agent-to-agent loop guard).
+    prompt: "Other agents' user ids (comma-separated, or empty)"
+    password: false
+  - name: NEXTCLOUD_TALK_AGENT_CHAIN_LIMIT
+    description: "Agent messages answered in a row before this account waits for a human (default 6)"
+    prompt: "Agent chain limit (default 6)"
+    password: false
+  - name: NEXTCLOUD_TALK_CONTEXT_MESSAGES
+    description: >-
+      Unanswered room messages kept per room and handed over as context
+      with the next message this account does answer (default 40; 0
+      disables active listening).
+    prompt: "Context backlog size (default 40, 0 disables)"
     password: false

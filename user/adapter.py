@@ -39,6 +39,20 @@ Environment variables (env wins over config.yaml ``extra``):
     NEXTCLOUD_TALK_WORKING_REACTION        Reaction added while a turn is being processed and
                                              removed once the reply is sent (default: the eyes
                                              emoji; empty string disables the feature)
+    NEXTCLOUD_TALK_AGENT_USERS             Other agents' Nextcloud user ids sharing this server
+                                             ("ops-bot,research-bot"); in a "free" room they still need an
+                                             explicit @mention of this account (loop guard)
+    NEXTCLOUD_TALK_AGENT_CHAIN_LIMIT       Agent messages answered in a row, with no human
+                                             message in between, before this account stops
+                                             answering that agent until a human speaks (default 6)
+    NEXTCLOUD_TALK_CONTEXT_MESSAGES        Unanswered room messages kept per room and handed
+                                             over with the next message this account does
+                                             answer, so "mention" mode still has context from
+                                             what it skipped (default 40; 0 disables)
+
+Active listening and the agent-to-agent loop guard only matter in a room
+with more than one participant (DMs are always addressed to this account,
+so neither applies there).
 """
 
 import asyncio
@@ -102,6 +116,26 @@ ROOM_MODE_MENTION = "mention"
 ROOM_MODE_WATCH = "watch"
 ROOM_MODE_FREE = "free"
 VALID_ROOM_MODES = frozenset({ROOM_MODE_MENTION, ROOM_MODE_WATCH, ROOM_MODE_FREE})
+
+# Agent-to-agent loop guard. A "free" room replies to every human message,
+# but two free agents replying to each other would never stop. So a message
+# from another agent (NEXTCLOUD_TALK_AGENT_USERS, or any Talk webhook bot)
+# still needs an explicit @mention of this account even in a free room, and
+# after AGENT_CHAIN_LIMIT agent messages in a row with no human message in
+# between, agent messages in that room are ignored until a human speaks again.
+AGENT_USERS_ENV = "NEXTCLOUD_TALK_AGENT_USERS"
+AGENT_CHAIN_LIMIT_ENV = "NEXTCLOUD_TALK_AGENT_CHAIN_LIMIT"
+DEFAULT_AGENT_CHAIN_LIMIT = 6
+ACTOR_TYPE_BOTS = "bots"  # Talk's actorType for a webhook-bot sender
+
+# Active listening. A message this account does not answer (mention mode
+# without a mention, or another agent not addressing it) is kept rather than
+# dropped, and the backlog is handed over as context with the next message it
+# does answer -- so a reply in mention mode is informed by what the room has
+# been saying, not just by the one line that named it.
+CONTEXT_MESSAGES_ENV = "NEXTCLOUD_TALK_CONTEXT_MESSAGES"
+DEFAULT_CONTEXT_MESSAGES = 40  # per room; 0 turns active listening off
+CONTEXT_MAX_CHARS = 8000       # oldest backlog lines are dropped past this
 
 _DISPLAY_MODE_PREFIX_RE = re.compile(r"^\s*\[(mention|watch|free)\]", re.IGNORECASE)
 
@@ -174,6 +208,60 @@ def _room_mode(token: str, display_name: Optional[str], modes_map: Dict[str, str
         if match:
             return match.group(1).lower()
     return modes_map.get(token, ROOM_MODE_MENTION)
+
+
+def _parse_agent_users(raw: Optional[str]) -> frozenset:
+    """Parse ``NEXTCLOUD_TALK_AGENT_USERS`` ("ops-bot,research-bot") to a set of lowercase ids."""
+    return frozenset(s.strip().lower() for s in (raw or "").split(",") if s.strip())
+
+
+def _is_agent_actor(actor: Dict[str, Optional[str]], agent_users: frozenset) -> bool:
+    """True for a Talk webhook-bot sender, or an actor listed in ``agent_users``.
+
+    A bare entry ("ops-bot") matches both the local user id and the same user
+    id on any federated instance ("ops-bot@remote-instance"); an entry that
+    already includes ``@`` matches only that exact qualified id.
+    """
+    if actor.get("type") == ACTOR_TYPE_BOTS:
+        return True
+    actor_id = (actor.get("id") or "").lower()
+    if not actor_id:
+        return False
+    return actor_id in agent_users or actor_id.split("@", 1)[0] in agent_users
+
+
+def _with_room_context(text: str, backlog: List[str]) -> str:
+    """Prefix an addressed message with what the room said since the last reply."""
+    if not backlog:
+        return text
+    return (
+        f"[Room messages since you last replied, {len(backlog)} line(s). Context only: "
+        "you were not addressed in these, so do not answer them one by one.]\n"
+        + "\n".join(backlog)
+        + "\n\n[The message addressed to you]\n"
+        + text
+    )
+
+
+def _with_room_rules(text: str, description: Optional[str]) -> str:
+    """Prefix an addressed message with the room's description, where a room keeps its rules.
+
+    The description is read fresh on every discovery pass, so a rule edited
+    in Talk itself reaches the agent on its next reply with no config or
+    restart on the Hermes side.
+    """
+    description = (description or "").strip()
+    if not description:
+        return text
+    return f"[Room rules, from the conversation description. Follow them.]\n{description}\n\n{text}"
+
+
+def _trim_backlog(backlog: List[str], max_messages: int) -> List[str]:
+    """Cap a room's context backlog by message count, then by total size."""
+    backlog = backlog[-max_messages:] if max_messages > 0 else []
+    while backlog and sum(len(line) + 1 for line in backlog) > CONTEXT_MAX_CHARS:
+        backlog = backlog[1:]
+    return backlog
 
 
 def _room_chat_type(room_type: Optional[int]) -> str:
@@ -378,6 +466,22 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._room_modes: Dict[str, str] = _parse_room_modes_env(
             extra.get("room_modes") or os.getenv("NEXTCLOUD_TALK_ROOM_MODES", "")
         )
+        self._agent_users: frozenset = _parse_agent_users(
+            extra.get("agent_users") or os.getenv(AGENT_USERS_ENV, "")
+        )
+        self._agent_chain_limit: int = int(
+            extra.get("agent_chain_limit")
+            or os.getenv(AGENT_CHAIN_LIMIT_ENV, DEFAULT_AGENT_CHAIN_LIMIT)
+        )
+        self._context_messages: int = int(
+            extra.get("context_messages")
+            if extra.get("context_messages") is not None
+            else os.getenv(CONTEXT_MESSAGES_ENV, DEFAULT_CONTEXT_MESSAGES)
+        )
+        # room token -> unanswered "name: text" lines since the agent last replied
+        self._room_context: Dict[str, List[str]] = {}
+        # room token -> agent messages seen in a row since the last human message
+        self._agent_chain: Dict[str, int] = {}
         self._discovery_interval: float = float(
             extra.get("discovery_interval_seconds")
             or os.getenv("NEXTCLOUD_TALK_DISCOVERY_INTERVAL_SECONDS", DEFAULT_DISCOVERY_INTERVAL)
@@ -653,12 +757,48 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             },
         )
 
+        from_agent = _is_agent_actor(actor, self._agent_users)
+        if from_agent:
+            self._agent_chain[token] = self._agent_chain.get(token, 0) + 1
+        else:
+            self._agent_chain[token] = 0
+
         if mode == ROOM_MODE_WATCH:
             self._watch_buffers.setdefault(token, []).append(event)
             return
         if mode == ROOM_MODE_MENTION and not mentioned:
+            self._remember(token, actor, text)
             return
+        if from_agent and chat_type != "dm":
+            if not mentioned:
+                # free means free for humans; another agent must still address us
+                self._remember(token, actor, text)
+                return
+            if self._agent_chain[token] > self._agent_chain_limit:
+                logger.info(
+                    "[%s] room %s: %d agent messages in a row with no human in "
+                    "between, ignoring %s until a human speaks",
+                    self.name, token, self._agent_chain[token], actor.get("id"),
+                )
+                self._remember(token, actor, text)
+                return
+
+        backlog = self._room_context.pop(token, [])
+        if backlog:
+            event.text = _with_room_context(text, backlog)
+            event.metadata["room_context_lines"] = len(backlog)
+        if chat_type != "dm":
+            event.text = _with_room_rules(event.text, room.get("description"))
         await self.handle_message(event)
+
+    def _remember(self, token: str, actor: Dict[str, Optional[str]], text: str) -> None:
+        """Keep an unanswered message as context for the next reply in this room."""
+        if self._context_messages <= 0:
+            return
+        name = actor.get("display_name") or actor.get("id") or "someone"
+        backlog = self._room_context.setdefault(token, [])
+        backlog.append(f"{name}: {text}")
+        self._room_context[token] = _trim_backlog(backlog, self._context_messages)
 
     @staticmethod
     def _parse_timestamp(unix_ts: Any) -> datetime:
