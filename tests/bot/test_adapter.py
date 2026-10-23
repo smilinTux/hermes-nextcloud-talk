@@ -6,6 +6,7 @@ handled events; aiohttp.test_utils.TestServer stands in for Nextcloud when
 exercising send()).
 """
 import asyncio
+import itertools
 import json
 import os
 import sys
@@ -22,11 +23,22 @@ sys.path.insert(0, os.path.join(TESTS_DIR, "stubs"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "bot"))
 
 import core  # noqa: E402
-from adapter import NextcloudTalkAdapter  # noqa: E402
+from adapter import MAX_WEBHOOK_BODY_BYTES, NextcloudTalkAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SessionSource  # noqa: E402
 
 SECRET = "x" * 64
+
+# A fresh 64-char nonce per webhook post by default, mirroring how Nextcloud
+# signs each real delivery attempt (including retries) with its own random --
+# so tests that post more than once don't accidentally collide with the new
+# nonce-replay cache in adapter.py's _handle_webhook. Tests exercising that
+# cache directly pass an explicit, deliberately-reused ``random=``.
+_NONCE_COUNTER = itertools.count(1)
+
+
+def _fresh_random() -> str:
+    return f"{next(_NONCE_COUNTER):064d}"
 
 
 def make_config(**extra_overrides):
@@ -40,7 +52,8 @@ def make_config(**extra_overrides):
     return PlatformConfig(enabled=True, extra=extra)
 
 
-def sign(body: bytes, random: str = "r" * 64) -> dict:
+def sign(body: bytes, random: str = None) -> dict:
+    random = random if random is not None else _fresh_random()
     return {
         "X-Nextcloud-Talk-Random": random,
         "X-Nextcloud-Talk-Signature": core.compute_signature(SECRET, random, body),
@@ -66,15 +79,17 @@ def adapter():
     return NextcloudTalkAdapter(make_config())
 
 
-async def _post_webhook(adapter_app_client, payload):
+async def _post_webhook(adapter_app_client, payload, *, random: str = None):
     body = json.dumps(payload).encode("utf-8")
-    headers = sign(body)
+    headers = sign(body, random=random)
     return await adapter_app_client.post("/webhooks/nextcloud-talk", data=body, headers=headers)
 
 
 @pytest_asyncio.fixture
 async def client(adapter):
-    app = web.Application()
+    # client_max_size matches production's connect() exactly (see adapter.py),
+    # so the body-size-cap tests exercise the real admission boundary.
+    app = web.Application(client_max_size=MAX_WEBHOOK_BODY_BYTES)
     app.router.add_post(adapter._path, adapter._handle_webhook)
     server = TestServer(app)
     client = TestClient(server)
@@ -130,12 +145,80 @@ async def test_webhook_includes_prior_context_on_mention(client):
 
 @pytest.mark.asyncio
 async def test_webhook_dedupes_retried_message_id(client):
+    # Each post gets its own fresh nonce (the default), modeling a real Talk
+    # retry: a fresh, re-signed delivery attempt carrying the same message id.
+    # Dedup here is the message-id layer (_dedupe), not the nonce-replay cache.
     c, adapter = client
     payload = create_payload(message="@Jarvis ping", msg_id="dup-1")
     await _post_webhook(c, payload)
     await _post_webhook(c, payload)
     await asyncio.sleep(0)
     assert len(adapter.handled_events) == 1
+
+
+# ---------------------------------------------------------------------------
+# Inbound hardening: nonce replay + body-size cap
+# (ported in concept from Cliff3c/hermes-nextcloud-talk, MIT; see adapter.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_exact_replay_same_nonce_same_body(client):
+    c, adapter = client
+    payload = create_payload(message="@Jarvis ping", msg_id="replay-1")
+    nonce = "same-nonce-reused-for-a-byte-for-byte-replay-attempt-000000000"
+    first = await _post_webhook(c, payload, random=nonce)
+    second = await _post_webhook(c, payload, random=nonce)
+    await asyncio.sleep(0)
+
+    assert first.status == 200
+    assert second.status == 409
+    assert len(adapter.handled_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_reused_nonce_even_with_a_different_body(client):
+    # The nonce cache keys on the random header alone, independent of the
+    # message id or content -- a captured nonce can't be reused to smuggle
+    # a different signed payload through either.
+    c, adapter = client
+    nonce = "reused-nonce-with-a-different-message-the-second-time-00000000"
+    first = await _post_webhook(c, create_payload(message="@Jarvis first", msg_id="a"), random=nonce)
+    second = await _post_webhook(c, create_payload(message="@Jarvis second", msg_id="b"), random=nonce)
+    await asyncio.sleep(0)
+
+    assert first.status == 200
+    assert second.status == 409
+    assert len(adapter.handled_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_accepts_same_payload_with_distinct_nonces():
+    # Sanity check for the fix above: two genuinely distinct deliveries (their
+    # own nonce each, as a real Talk retry would look) are NOT nonce-replay
+    # rejected -- only exact nonce reuse is. (Message-id dedup still applies;
+    # see test_webhook_dedupes_retried_message_id.)
+    adapter = NextcloudTalkAdapter(make_config(rooms={"room1": {"mode": "free"}}))
+    app = web.Application(client_max_size=MAX_WEBHOOK_BODY_BYTES)
+    app.router.add_post(adapter._path, adapter._handle_webhook)
+    async with TestClient(TestServer(app)) as c:
+        first = await _post_webhook(c, create_payload(message="hi one", msg_id="x"))
+        second = await _post_webhook(c, create_payload(message="hi two", msg_id="y"))
+    assert first.status == 200
+    assert second.status == 200
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_oversized_body(client):
+    c, adapter = client
+    oversized = b"a" * (MAX_WEBHOOK_BODY_BYTES + 1)
+    resp = await c.post(
+        "/webhooks/nextcloud-talk",
+        data=oversized,
+        headers=sign(oversized),
+    )
+    assert resp.status == 413
+    assert adapter.handled_events == []
 
 
 @pytest.mark.asyncio

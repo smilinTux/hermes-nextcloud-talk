@@ -73,6 +73,19 @@ matching mode automatically (see "Mode selection" below).
 See [`bot/plugin.yaml`](./bot/plugin.yaml) for every optional env var
 (per-room modes, mention trigger words, allowlisting, reaction emoji).
 
+### Inbound webhook hardening (bot mode)
+
+Every inbound webhook is HMAC-verified before anything else runs. Two
+further admission checks sit ahead of payload parsing: the request body
+is capped at an explicit 1 MiB (`MAX_WEBHOOK_BODY_BYTES`), and the
+`X-Nextcloud-Talk-Random` nonce on a signed request is tracked in a
+bounded, TTL cache so an exact replay of a previously-accepted request is
+rejected (`409`) outright, independent of (and ahead of) the existing
+message-id dedup that already catches retried deliveries. Both checks
+were ported, in concept, from
+[Cliff3c/hermes-nextcloud-talk](https://github.com/Cliff3c/hermes-nextcloud-talk)
+(MIT) -- see [THIRD_PARTY.md](./THIRD_PARTY.md).
+
 ### User mode
 
 1. Create a dedicated Nextcloud account for the agent (do not reuse a
@@ -223,4 +236,5 @@ See [SECURITY.md](./SECURITY.md).
 
 ## License
 
-MIT, see [LICENSE](./LICENSE).
+MIT, see [LICENSE](./LICENSE). Third-party credit for ported ideas: see
+[THIRD_PARTY.md](./THIRD_PARTY.md).

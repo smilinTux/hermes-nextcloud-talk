@@ -23,6 +23,20 @@ All three modes feed every inbound message into a per-room rolling context
 buffer (``nextcloud_talk_core.RoomBuffer``) -- bots cannot fetch Talk history,
 so this buffer is the only memory of "what was said before" the bot was
 @mentioned.
+
+Inbound delivery hardening (explicit body-size cap, a nonce-replay cache
+ahead of payload parsing) was ported, in concept and independently
+reimplemented against this file's own ``DedupeCache``/constant-naming
+conventions, from the webhook admission design in
+`Cliff3c/hermes-nextcloud-talk <https://github.com/Cliff3c/hermes-nextcloud-talk>`_
+(MIT License, Copyright (c) 2026 Cliff3c) -- see THIRD_PARTY.md and the
+CHANGELOG entry for this release. One piece of that design does not apply
+here and was deliberately left out rather than added as dead code: Cliff3c's
+adapter parses the outbound OCS *send* response (JSON or, on Nextcloud 32,
+XML) to recover a message id, so it hardens that XML parse against DTDs.
+This adapter's own ``_post_message`` never parses the send response body at
+all -- it only checks the HTTP status and keeps the raw text -- so there is
+no XML parser anywhere in this file's request path to harden.
 """
 from __future__ import annotations
 
@@ -85,6 +99,13 @@ MAX_MESSAGE_LENGTH = 32000
 DEDUPE_TTL_SECONDS = 300
 WATCH_POLL_INTERVAL_SECONDS = 15  # background task granularity; per-room interval governs cadence
 
+# Inbound webhook hardening. Named/explicit versions of two admission checks
+# -- a body-size ceiling and a nonce-replay cache ahead of payload parsing --
+# whose shape is ported from Cliff3c/hermes-nextcloud-talk (MIT); see the
+# module docstring above and THIRD_PARTY.md.
+MAX_WEBHOOK_BODY_BYTES = 1024 * 1024  # 1 MiB; matches aiohttp's own default, made explicit
+NONCE_REPLAY_TTL_SECONDS = 3600  # a signed X-Nextcloud-Talk-Random must never repeat
+
 DEFAULT_WORKING_REACTION = "\U0001F440"  # 👀 -- visible "I'm on it" signal; Talk bots have no typing indicator
 ERROR_REACTION = "⚠️"  # ⚠️ -- swapped in for 👀 on a failed turn; not configurable (always this)
 
@@ -139,6 +160,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._app: Optional["web.Application"] = None
         self._http: Optional["ClientSession"] = None
         self._dedupe = DedupeCache(ttl_seconds=DEDUPE_TTL_SECONDS)
+        # Separate from _dedupe above: _dedupe keys on the Talk *message id*
+        # (parsed out of the JSON body, so it only ever runs once the body is
+        # known-good JSON); this one keys on the raw inbound random nonce and
+        # runs immediately after signature verification, before any parsing,
+        # so a byte-for-byte replay of a previously-accepted signed request
+        # (not just a duplicate Talk message) is rejected outright.
+        self._seen_nonces = DedupeCache(ttl_seconds=NONCE_REPLAY_TTL_SECONDS)
         self._buffers: Dict[str, RoomBuffer] = {}
         self._watch_last_dispatch: Dict[str, float] = {}
         self._rate_limiter = WatchRateLimiter(max_per_hour=12)
@@ -174,7 +202,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         try:
             self._http = ClientSession(timeout=ClientTimeout(total=20.0))
-            self._app = web.Application()
+            self._app = web.Application(client_max_size=MAX_WEBHOOK_BODY_BYTES)
             self._app.router.add_get(self._path + "/health", self._handle_health)
             self._app.router.add_post(self._path, self._handle_webhook)
             self._runner = web.AppRunner(self._app)
@@ -346,6 +374,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if not verify_signature(self._secret, random, body, signature):
             logger.warning("[NextcloudTalk] Rejected webhook: bad signature")
             return web.Response(status=401, text="invalid signature")
+
+        if self._seen_nonces.seen_before(random):
+            logger.warning("[NextcloudTalk] Rejected webhook: replayed random nonce")
+            return web.Response(status=409, text="replayed request")
 
         try:
             import json
