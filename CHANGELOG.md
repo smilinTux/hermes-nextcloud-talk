@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.4.1] - 2026-10-24
+
+### Fixed
+
+- Rich mention ids are compared case-insensitively. A federated client resolved
+  "@Jarvis" to id `Jarvis` for the local account `jarvis`, so the mention was
+  missed and agent-to-agent replies stopped after one round.
+
 ## [1.4.0] - 2026-10-24
 
 ### Breaking

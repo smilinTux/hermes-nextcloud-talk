@@ -769,3 +769,8 @@ def test_room_rules_opt_in_applies_to_every_room():
     _run(adapter._on_message("tok1", _talk_message("1", "alice", "@hermes-bot hi", params=params)))
 
     assert adapter.handled_events[0].text.startswith("[Room rules")
+
+
+def test_mention_rich_parameter_id_is_case_insensitive():
+    params = {"mention-user1": {"type": "user", "id": "Hermes-Bot", "name": "Hermes"}}
+    assert _is_mention("{mention-user1} hi", params, "hermes-bot", "Hermes") is True

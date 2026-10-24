@@ -363,7 +363,10 @@ def _is_mention(
     for param in message_parameters.values():
         if not isinstance(param, dict):
             continue
-        if param.get("type") in ("user", "call") and param.get("id") == own_user_id:
+        # Talk ids are case-insensitive: a federated sender's client can resolve
+        # "@Jarvis" to id "Jarvis" for the local account "jarvis".
+        if (param.get("type") in ("user", "call")
+                and str(param.get("id") or "").casefold() == (own_user_id or "").casefold()):
             return True
 
     text = text or ""
