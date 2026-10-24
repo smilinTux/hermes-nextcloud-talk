@@ -44,6 +44,7 @@ from user.adapter import (
     _invite_accept_path,
     _is_agent_actor,
     _is_mention,
+    _resolve_mention_placeholders,
     _is_pending_invite,
     _is_skippable_room,
     _ocs_headers,
@@ -737,3 +738,13 @@ def test_watch_digest_allow_all_users_keeps_every_sender():
     _run(adapter._dispatch_watch_digest("tok1", events))
 
     assert "one" in adapter.handled_events[0].text and "two" in adapter.handled_events[0].text
+
+
+def test_mention_placeholder_resolved_to_at_name():
+    params = {"mention-federated-user1": {"type": "user", "id": "lumina", "name": "lumina"}}
+    assert _resolve_mention_placeholders("{mention-federated-user1} - hi", params) == "@lumina - hi"
+
+
+def test_unknown_placeholder_left_untouched():
+    assert _resolve_mention_placeholders("{mention-user9} x", {}) == "{mention-user9} x"
+    assert _resolve_mention_placeholders("{file0}", {"file0": {"name": "a.txt"}}) == "{file0}"

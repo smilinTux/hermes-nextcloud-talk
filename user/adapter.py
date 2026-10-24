@@ -322,6 +322,25 @@ def _is_skippable_room(room_type: Optional[int]) -> bool:
     return room_type == ROOM_TYPE_NOTE_TO_SELF
 
 
+def _resolve_mention_placeholders(text: str, parameters: Optional[Dict[str, Any]]) -> str:
+    """Replace Talk's ``{mention-...}`` placeholders with ``@name``.
+
+    Without this the model sees ``{mention-federated-user1}`` instead of
+    ``@lumina`` and, under "reply only when @mentioned" room rules, decides it
+    was not addressed and returns a silence marker.
+    """
+    if not parameters:
+        return text
+
+    def _sub(match: "re.Match[str]") -> str:
+        param = parameters.get(match.group(1))
+        if isinstance(param, dict) and param.get("name"):
+            return f"@{param['name']}"
+        return match.group(0)
+
+    return re.sub(r"\{(mention-[a-zA-Z0-9_-]+)\}", _sub, text)
+
+
 def _is_mention(
     text: str,
     message_parameters: Optional[Dict[str, Any]],
@@ -786,6 +805,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         mentioned = _is_mention(
             text, message.get("messageParameters"), self._username, self._display_name
         )
+        text = _resolve_mention_placeholders(text, message.get("messageParameters"))
 
         source = self.build_source(
             chat_id=token,
