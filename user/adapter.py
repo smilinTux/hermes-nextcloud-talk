@@ -120,7 +120,7 @@ LONG_POLL_TIMEOUT_ENV = "NEXTCLOUD_TALK_LONG_POLL_TIMEOUT"
 # NEXTCLOUD_TALK_LONG_POLL_TIMEOUT if your front door's timeout is different
 # (or set it back to 30 if nothing sits in front of Hermes).
 DEFAULT_LONG_POLL_TIMEOUT = 25
-LONG_POLL_TIMEOUT = int(os.getenv(LONG_POLL_TIMEOUT_ENV, DEFAULT_LONG_POLL_TIMEOUT))
+ROOM_RULES_ALL_ENV = "NEXTCLOUD_TALK_ROOM_RULES_ALL_ROOMS"
 BASELINE_LOOKUP_LIMIT = 1
 DEDUP_MAX_SIZE = 2000
 DEDUP_WINDOW_SECONDS = 600
@@ -542,6 +542,14 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             if extra.get("context_messages") is not None
             else os.getenv(CONTEXT_MESSAGES_ENV, DEFAULT_CONTEXT_MESSAGES)
         )
+        self._room_rules_all: bool = _truthy(
+            extra.get("room_rules_all_rooms") or os.getenv(ROOM_RULES_ALL_ENV, "")
+        )
+        # Read at adapter start, not import, so it is correct per profile.
+        self._long_poll_timeout: int = int(
+            extra.get("long_poll_timeout")
+            or os.getenv(LONG_POLL_TIMEOUT_ENV, DEFAULT_LONG_POLL_TIMEOUT)
+        )
         # room token -> unanswered "name: text" lines since the agent last replied
         self._room_context: Dict[str, List[str]] = {}
         # room token -> agent messages seen in a row since the last human message
@@ -590,7 +598,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._http_client = httpx.AsyncClient(
             base_url=self._server,
             headers=_ocs_headers(self._username, self._app_password),
-            timeout=httpx.Timeout(connect=15.0, read=LONG_POLL_TIMEOUT + 15.0, write=15.0, pool=15.0),
+            timeout=httpx.Timeout(connect=15.0, read=self._long_poll_timeout + 15.0, write=15.0, pool=15.0),
         )
         self._running = True
         self._discovery_task = asyncio.create_task(self._discovery_loop())
@@ -760,7 +768,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 "format": "json",
                 "lookIntoFuture": 1,
                 "lastKnownMessageId": last_given,
-                "timeout": LONG_POLL_TIMEOUT,
+                "timeout": self._long_poll_timeout,
                 "limit": 100,
             },
         )
@@ -854,13 +862,19 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         backlog = self._room_context.pop(token, [])
         if backlog:
             event.text = _with_room_context(text, backlog)
-        if chat_type != "dm":
+        if chat_type != "dm" and (self._room_rules_all or token in self._room_modes):
+            # Whoever creates a room writes its description; only rooms the
+            # operator listed (or an explicit opt-in) may hand the agent rules.
             event.text = _with_room_rules(event.text, room.get("description"))
         await self.handle_message(event)
 
     def _remember(self, token: str, actor: Dict[str, Optional[str]], text: str) -> None:
         """Keep an unanswered message as context for the next reply in this room."""
         if self._context_messages <= 0:
+            return
+        if not self._sender_allowed(actor.get("id")):
+            # Same filter as watch digests: an unlisted sender's text never
+            # rides into a later turn as room context.
             return
         name = actor.get("display_name") or actor.get("id") or "someone"
         backlog = self._room_context.setdefault(token, [])

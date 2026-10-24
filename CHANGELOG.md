@@ -4,6 +4,29 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.4.0] - 2026-10-24
+
+### Breaking
+
+- **Manifest renamed `nextcloud-talk` -> `nextcloud-talk-platform`.** The old
+  name clashed with the other catalog Talk plugin in `plugins.enabled`.
+  Update `plugins.enabled` in `config.yaml` to `nextcloud-talk-platform`.
+
+### Security (PR 140197 review, round 2)
+
+- Room context (active listening) only carries lines from senders that pass
+  the allowlist, the same filter watch digests use.
+- Room descriptions are applied as rules only in rooms listed in
+  `NEXTCLOUD_TALK_ROOM_MODES`, or everywhere with the explicit opt-in
+  `NEXTCLOUD_TALK_ROOM_RULES_ALL_ROOMS=true`.
+
+### Fixed
+
+- `{mention-...}` placeholders are resolved to `@name` before the model sees
+  the message, so "reply only when @mentioned" rules work.
+- `NEXTCLOUD_TALK_LONG_POLL_TIMEOUT` is read when the adapter starts (per
+  profile), not at import time; `long_poll_timeout` in config extra wins.
+
 ## [1.3.0] - 2026-10-24
 
 ### Breaking
