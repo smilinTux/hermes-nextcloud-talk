@@ -4,6 +4,35 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.3.0] - 2026-10-24
+
+### Breaking
+
+- **Platform id renamed `nextcloud_talk` -> `nctalk`.** Another author's Talk
+  plugin in the Hermes catalog registers `nextcloud_talk`, and two plugins
+  claiming one id silently replace each other. Rename the `platforms:` key
+  (and any `platform_toolsets:` / `home_channel.platform:` entries) in
+  `config.yaml` from `nextcloud_talk` to `nctalk`, then restart the gateway.
+  Env var names are unchanged (`NEXTCLOUD_TALK_*`). Sessions keyed on the
+  old id start fresh.
+- **`[watch]`/`[free]`/`[mention]` display-name prefixes only apply to rooms
+  listed in `NEXTCLOUD_TALK_ROOM_MODES`.** Any Nextcloud user can name a room
+  `[watch] ...`; unlisted rooms are now always `mention`.
+
+### Fixed
+
+- Watch-mode digests (both modes) are dispatched as ordinary inbound events,
+  not `internal`, so the gateway allowlist and pause gate apply. Lines from
+  senders outside `NEXTCLOUD_TALK_ALLOWED_USERS` are dropped before the
+  digest is built (all kept with `NEXTCLOUD_TALK_ALLOW_ALL_USERS`).
+- User mode no longer stamps `metadata` (`source_tag`, `mentioned`,
+  `room_mode`, `room_context_lines`) on inbound events. Newer Hermes cores
+  refuse non-WhatsApp metadata at native admission
+  (`invalid_params (metadata)`), which dropped every addressed message.
+- `NEXTCLOUD_TALK_APP_PASSWORD` and `NEXTCLOUD_TALK_SECRET` are read through
+  `agent.secret_scope.get_secret`, falling back to the environment on Hermes
+  builds without it.
+
 ## [1.2.0] - 2026-10-23
 
 ### Added (bot mode)

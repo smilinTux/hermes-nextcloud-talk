@@ -1,6 +1,6 @@
 """Nextcloud Talk bot adapter for the Hermes gateway (webhook bot mode).
 
-Deployed as a drop-in plugin: ``~/.hermes/plugins/nextcloud_talk_bot/``
+Deployed as a drop-in plugin: ``~/.hermes/plugins/nctalk_bot/``
 (``__init__.py`` + this file + ``core.py``, copied verbatim from this repo),
 or installed in one piece via the combined repo root (see the top-level
 README). It follows the checklist in Hermes's own
@@ -14,13 +14,13 @@ rooms a moderator has run ``occ talk:bot:setup`` in (Nextcloud-side), and
 per-user allowlist here (mirrors how Platform.WEBHOOK is already treated in
 ``gateway/run.py::_is_user_authorized`` -- HMAC auth IS the authorization).
 
-Three per-room modes (config.yaml ``nextcloud_talk.extra.rooms.<token>.mode``):
+Three per-room modes (config.yaml ``nctalk.extra.rooms.<token>.mode``):
   - "mention" (default): reply only when @Jarvis-style text is detected.
   - "watch": buffer messages; a periodic background task decides whether to
     say anything (summary / unanswered question / action items), rate-limited.
   - "free": reply to every message (intended for a Jarvis-only room).
 All three modes feed every inbound message into a per-room rolling context
-buffer (``nextcloud_talk_core.RoomBuffer``) -- bots cannot fetch Talk history,
+buffer (``nctalk_core.RoomBuffer``) -- bots cannot fetch Talk history,
 so this buffer is the only memory of "what was said before" the bot was
 @mentioned.
 
@@ -59,13 +59,33 @@ except ImportError:  # pragma: no cover
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+# Platform id. Not ``nextcloud_talk``: another author's Talk plugin in the
+# Hermes catalog registers that id, and two plugins claiming one id silently
+# replace each other. Env var names keep the NEXTCLOUD_TALK_ prefix.
+PLATFORM_NAME = "nctalk"
+
+try:  # Hermes resolves credentials per profile scope (multiplexed gateways)
+    from agent.secret_scope import get_secret as _hermes_get_secret
+except ImportError:  # pragma: no cover - older Hermes / test stubs
+    _hermes_get_secret = None
+
+
+def _secret(name: str, default: str = "") -> str:
+    """Read a credential through Hermes' secret scope, falling back to the env."""
+    if _hermes_get_secret is not None:
+        val = _hermes_get_secret(name, default)
+        return default if val is None else val
+    return os.getenv(name, default)
+
 
 try:  # drop-in plugin layout: core.py is this file's sibling in the
-    # package (~/.hermes/plugins/nextcloud_talk_bot/{__init__,adapter,core}.py)
+    # package (~/.hermes/plugins/nctalk_bot/{__init__,adapter,core}.py)
     from .core import (
         DedupeCache,
         RoomBuffer,
         WatchRateLimiter,
+        parse_allowlist,
+        sender_allowed,
         compute_signature,
         is_mentioned,
         is_quiet_reply,
@@ -80,6 +100,8 @@ except ImportError:  # pragma: no cover - local dev/test fallback (flat sys.path
         DedupeCache,
         RoomBuffer,
         WatchRateLimiter,
+        parse_allowlist,
+        sender_allowed,
         compute_signature,
         is_mentioned,
         is_quiet_reply,
@@ -119,18 +141,18 @@ _PLATFORM_HINT = (
 )
 
 
-def check_nextcloud_talk_requirements() -> bool:
+def check_nctalk_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
 class NextcloudTalkAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
-        # Platform("nextcloud_talk") rather than a Platform.NEXTCLOUD_TALK
+        # Platform("nctalk") rather than a Platform.NEXTCLOUD_TALK
         # attribute: upstream's enum has no such built-in member, and
         # Platform._missing_() synthesizes one for any plugin platform name
         # (see register() below -- this is the drop-in plugin path, no
         # core-tree edit to gateway/config.py).
-        super().__init__(config, Platform("nextcloud_talk"))
+        super().__init__(config, Platform(PLATFORM_NAME))
         extra = config.extra or {}
         self._host = str(extra.get("host") or DEFAULT_HOST)
         self._port = int(extra.get("port") or DEFAULT_PORT)
@@ -138,6 +160,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._secret = str(extra.get("secret") or "")
         self._base_url = str(extra.get("base_url") or "").rstrip("/")
         self._rooms_cfg: Dict[str, Any] = extra.get("rooms") or {}
+        self._allowed_users = parse_allowlist(
+            extra.get("allowed_users") or os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
+        )
+        self._allow_all_users = str(
+            extra.get("allow_all_users") or os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
+        ).strip().lower() in ("1", "true", "yes", "on")
         self._triggers = extra.get("mention_triggers") or ["jarvis"]
         self._context_max_messages = int(extra.get("context_window_messages", 40))
         self._context_max_age = float(extra.get("context_window_minutes", 240)) * 60
@@ -181,7 +209,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         # later upstream release than this adapter originally targeted; this
         # webhook adapter has no reconnect-specific behavior (no persistent
         # outbound connection to resume), so the flag is accepted and ignored.
-        if not check_nextcloud_talk_requirements():
+        if not check_nctalk_requirements():
             logger.warning("[NextcloudTalk] aiohttp not installed")
             return False
         if not self._secret:
@@ -364,7 +392,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        return web.json_response({"status": "ok", "platform": "nextcloud_talk"})
+        return web.json_response({"status": "ok", "platform": PLATFORM_NAME})
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         body = await request.read()
@@ -405,7 +433,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 max_age_seconds=self._context_max_age,
             ),
         )
-        buf.add(parsed.actor_name, resolved_text)
+        buf.add(parsed.actor_name, resolved_text, actor_id=parsed.actor_id)
 
         mode_cfg = resolve_room_mode(self._rooms_cfg, parsed.room_token)
         mode = mode_cfg["mode"]
@@ -467,8 +495,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             mode_cfg = resolve_room_mode(self._rooms_cfg, room_token)
             if mode_cfg["mode"] != "watch":
                 continue
-            unseen = buf.unseen_for_watch()
+            unseen = [
+                m for m in buf.unseen_for_watch()
+                if sender_allowed(m.actor_id, self._allowed_users, self._allow_all_users)
+            ]
             if not unseen:
+                buf.mark_watch_seen()  # nothing from an allowed sender to review
                 continue
             last = self._watch_last_dispatch.get(room_token, 0.0)
             if now - last < mode_cfg["watch_interval_seconds"]:
@@ -491,15 +523,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 chat_id=room_token,
                 chat_name=room_token,
                 chat_type="group",
-                user_id=None,
-                user_name="watch-mode",
+                user_id=unseen[-1].actor_id or None,
+                user_name=unseen[-1].actor_name,
             )
             event = MessageEvent(
                 text=f"[New messages since last review]\n{lines}",
                 message_type=MessageType.TEXT,
                 source=source,
                 channel_prompt=watch_prompt,
-                internal=True,
             )
             buf.mark_watch_seen()
             self._watch_last_dispatch[room_token] = now
@@ -578,12 +609,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
 
 def check_requirements() -> bool:
-    return check_nextcloud_talk_requirements()
+    return check_nctalk_requirements()
 
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    secret = os.getenv("NEXTCLOUD_TALK_SECRET") or extra.get("secret")
+    secret = _secret("NEXTCLOUD_TALK_SECRET") or extra.get("secret")
     base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL") or extra.get("base_url")
     return bool(secret and base_url)
 
@@ -593,7 +624,7 @@ def _env_enablement() -> Optional[dict]:
     without a config.yaml edit (mirrors how the adapter already read these
     vars directly in __init__ before the plugin env_enablement_fn hook
     existed -- see PLAN.md section 4 for the env var semantics)."""
-    secret = os.getenv("NEXTCLOUD_TALK_SECRET", "").strip()
+    secret = _secret("NEXTCLOUD_TALK_SECRET", "").strip()
     base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "").strip()
     if not (secret and base_url):
         return None
@@ -633,7 +664,7 @@ def _env_enablement() -> Optional[dict]:
 def register(ctx) -> None:
     """Plugin entry point -- called by the Hermes plugin system at startup."""
     ctx.register_platform(
-        name="nextcloud_talk",
+        name=PLATFORM_NAME,
         label="Nextcloud Talk (webhook bot)",
         adapter_factory=lambda cfg: NextcloudTalkAdapter(cfg),
         check_fn=check_requirements,

@@ -23,7 +23,7 @@ no Hermes-level per-user allowlist layered underneath unless you opt in.
   into any room the bot is enabled in and can hit the bot's `send()`
   endpoint -- but still cannot read rooms the bot isn't enabled in, cannot
   act as any Nextcloud user, and the agent triggered this way only has
-  whatever toolset you grant the `nextcloud_talk` platform (keep it
+  whatever toolset you grant the `nctalk` platform (keep it
   narrow: no terminal/filesystem/code-exec/outbound-messaging tools for a
   bot that untrusted room members can message).
 - **Network exposure**: the webhook listener should bind to a private

@@ -1,7 +1,12 @@
 # hermes-nextcloud-talk
 
 Two independent Nextcloud Talk connectors for [Hermes Agent](https://github.com/NousResearch/hermes-agent),
-packaged as one plugin that registers a single `nextcloud_talk` platform:
+packaged as one plugin that registers a single `nctalk` platform:
+
+
+> **Upgrading from 1.2.x:** the platform id is now `nctalk` (was
+> `nextcloud_talk`). Rename that key in `config.yaml` and restart. See
+> CHANGELOG 1.3.0.
 
 - **`bot/`** -- a webhook bot, using Nextcloud Talk's own
   [Bot API](https://nextcloud-talk.readthedocs.io/en/latest/bots/)
@@ -183,24 +188,24 @@ The root `register(ctx)` picks a mode once, by which credential is set:
 Combined (both modes available, pick one via credentials as above):
 
 ```
-mkdir -p ~/.hermes/plugins/nextcloud_talk
-cp -r __init__.py plugin.yaml bot user ~/.hermes/plugins/nextcloud_talk/
+mkdir -p ~/.hermes/plugins/nctalk
+cp -r __init__.py plugin.yaml bot user ~/.hermes/plugins/nctalk/
 ```
 
 Bot mode only:
 
 ```
-mkdir -p ~/.hermes/plugins/nextcloud_talk_bot
-cp bot/adapter.py bot/core.py bot/plugin.yaml ~/.hermes/plugins/nextcloud_talk_bot/
-cp bot/__init__.py ~/.hermes/plugins/nextcloud_talk_bot/__init__.py
+mkdir -p ~/.hermes/plugins/nctalk_bot
+cp bot/adapter.py bot/core.py bot/plugin.yaml ~/.hermes/plugins/nctalk_bot/
+cp bot/__init__.py ~/.hermes/plugins/nctalk_bot/__init__.py
 ```
 
 User mode only:
 
 ```
-mkdir -p ~/.hermes/plugins/nextcloud_talk_user
-cp user/adapter.py user/plugin.yaml ~/.hermes/plugins/nextcloud_talk_user/
-cp user/__init__.py ~/.hermes/plugins/nextcloud_talk_user/__init__.py
+mkdir -p ~/.hermes/plugins/nctalk_user
+cp user/adapter.py user/plugin.yaml ~/.hermes/plugins/nctalk_user/
+cp user/__init__.py ~/.hermes/plugins/nctalk_user/__init__.py
 ```
 
 ## Repo layout

@@ -185,7 +185,14 @@ def test_room_mode_display_name_prefix_overrides_env_map():
 
 
 def test_room_mode_display_name_prefix_case_insensitive():
-    assert _room_mode("tok1", "[FREE] test room", {}) == ROOM_MODE_FREE
+    modes = {"tok1": ROOM_MODE_MENTION}
+    assert _room_mode("tok1", "[FREE] test room", modes) == ROOM_MODE_FREE
+
+
+def test_room_mode_prefix_ignored_for_rooms_the_operator_did_not_list():
+    # Anyone can name a room "[watch] ..." -- only listed rooms honour it.
+    assert _room_mode("tok1", "[watch] Ops Room", {}) == ROOM_MODE_MENTION
+    assert _room_mode("tok1", "[free] Ops Room", {"other": ROOM_MODE_FREE}) == ROOM_MODE_MENTION
 
 
 def test_parse_room_modes_env_basic():
@@ -524,7 +531,7 @@ def _run(coro):
 
 
 def test_agent_message_in_free_room_without_mention_is_not_forwarded():
-    adapter = _make_adapter(agent_users="ops-bot")
+    adapter = _make_adapter(agent_users="ops-bot", room_modes="tok1=free")
     adapter._room_meta["tok1"] = _free_group_room("tok1")
 
     _run(adapter._on_message("tok1", _talk_message("1", "ops-bot", "hey team, status?")))
@@ -533,7 +540,7 @@ def test_agent_message_in_free_room_without_mention_is_not_forwarded():
 
 
 def test_agent_message_in_free_room_with_mention_is_forwarded():
-    adapter = _make_adapter(agent_users="ops-bot")
+    adapter = _make_adapter(agent_users="ops-bot", room_modes="tok1=free")
     adapter._room_meta["tok1"] = _free_group_room("tok1")
     params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
 
@@ -543,7 +550,7 @@ def test_agent_message_in_free_room_with_mention_is_forwarded():
 
 
 def test_agent_chain_limit_silences_agent_until_a_human_speaks():
-    adapter = _make_adapter(agent_users="ops-bot", agent_chain_limit=2)
+    adapter = _make_adapter(agent_users="ops-bot", agent_chain_limit=2, room_modes="tok1=free")
     adapter._room_meta["tok1"] = _free_group_room("tok1")
     params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
 
@@ -560,7 +567,7 @@ def test_agent_chain_limit_silences_agent_until_a_human_speaks():
 
 
 def test_webhook_bot_actor_type_counts_as_agent_even_when_unlisted():
-    adapter = _make_adapter()  # no agent_users configured
+    adapter = _make_adapter(room_modes="tok1=free")  # no agent_users configured
     adapter._room_meta["tok1"] = _free_group_room("tok1")
 
     _run(adapter._on_message("tok1", _talk_message("1", "some-bot", "hey team", actor_type="bots")))
@@ -582,7 +589,7 @@ def test_mention_mode_remembers_unaddressed_messages_as_context():
     event = adapter.handled_events[0]
     assert "alice: anyone around?" in event.text
     assert event.text.endswith("[The message addressed to you]\n@hermes-bot status?")
-    assert event.metadata["room_context_lines"] == 1
+    assert event.metadata == {}  # newer Hermes refuses non-WhatsApp metadata
     # The backlog is consumed, not replayed on the next addressed message.
     _run(adapter._on_message("tok1", _talk_message("3", "bob", "@hermes-bot again?", params=params)))
     assert "alice: anyone around?" not in adapter.handled_events[1].text
@@ -602,7 +609,7 @@ def test_context_messages_zero_disables_active_listening():
 
 
 def test_room_description_is_applied_as_rules_for_group_rooms():
-    adapter = _make_adapter()
+    adapter = _make_adapter(room_modes="tok1=free")
     adapter._room_meta["tok1"] = _free_group_room("tok1", description="Be brief.")
 
     _run(adapter._on_message("tok1", _talk_message("1", "alice", "hello")))
@@ -664,3 +671,69 @@ def test_long_poll_timeout_honors_env_override():
 
 def test_long_poll_timeout_can_be_restored_to_talks_own_ceiling():
     assert _reload_adapter_with_env("30") == 30
+
+
+# -- v1.3.0: platform id, metadata, secrets, watch-digest allowlist -------
+
+
+def test_platform_name_is_distinct_from_the_other_catalog_talk_plugin():
+    assert user_adapter.PLATFORM_NAME == "nctalk"
+    assert _make_adapter().platform.value == "nctalk"
+
+
+def test_inbound_event_carries_no_adapter_metadata():
+    adapter = _make_adapter(room_modes="tok1=free")
+    adapter._room_meta["tok1"] = _free_group_room("tok1")
+
+    _run(adapter._on_message("tok1", _talk_message("1", "alice", "hello")))
+
+    assert len(adapter.handled_events) == 1
+    assert adapter.handled_events[0].metadata == {}
+
+
+def test_secret_falls_back_to_env_without_hermes_secret_scope(monkeypatch):
+    monkeypatch.setattr(user_adapter, "_hermes_get_secret", None)
+    monkeypatch.setenv("NEXTCLOUD_TALK_APP_PASSWORD", "from-env")
+    assert user_adapter._secret("NEXTCLOUD_TALK_APP_PASSWORD") == "from-env"
+
+
+def test_secret_reads_through_hermes_secret_scope_when_available(monkeypatch):
+    monkeypatch.setattr(user_adapter, "_hermes_get_secret", lambda name, default=None: "scoped")
+    monkeypatch.setenv("NEXTCLOUD_TALK_APP_PASSWORD", "from-env")
+    assert user_adapter._secret("NEXTCLOUD_TALK_APP_PASSWORD") == "scoped"
+
+
+def _watch_event(adapter, user_id, text):
+    source = adapter.build_source(chat_id="tok1", chat_type="group", user_id=user_id, user_name=user_id)
+    return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+
+
+def test_watch_digest_drops_unlisted_senders_and_is_not_internal():
+    adapter = _make_adapter(allowed_users="alice")
+    events = [_watch_event(adapter, "alice", "deploy at 5"), _watch_event(adapter, "mallory", "rm -rf /")]
+
+    _run(adapter._dispatch_watch_digest("tok1", events))
+
+    assert len(adapter.handled_events) == 1
+    digest = adapter.handled_events[0]
+    assert digest.internal is False
+    assert "deploy at 5" in digest.text
+    assert "rm -rf" not in digest.text
+    assert digest.source.user_id == "alice"
+
+
+def test_watch_digest_with_no_allowed_sender_is_not_dispatched():
+    adapter = _make_adapter(allowed_users="alice")
+
+    _run(adapter._dispatch_watch_digest("tok1", [_watch_event(adapter, "mallory", "hi")]))
+
+    assert adapter.handled_events == []
+
+
+def test_watch_digest_allow_all_users_keeps_every_sender():
+    adapter = _make_adapter(allow_all_users="true")
+    events = [_watch_event(adapter, "alice", "one"), _watch_event(adapter, "bob", "two")]
+
+    _run(adapter._dispatch_watch_digest("tok1", events))
+
+    assert "one" in adapter.handled_events[0].text and "two" in adapter.handled_events[0].text

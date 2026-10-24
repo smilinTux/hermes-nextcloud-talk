@@ -364,10 +364,13 @@ async def test_send_reports_failure_on_http_error():
 @pytest.mark.asyncio
 async def test_watch_tick_dispatches_when_interval_elapsed_and_buffers_exist():
     adapter = NextcloudTalkAdapter(
-        make_config(rooms={"room1": {"mode": "watch", "watch_interval_seconds": 0}})
+        make_config(
+            rooms={"room1": {"mode": "watch", "watch_interval_seconds": 0}},
+            allowed_users="users/chef",
+        )
     )
     adapter._buffers["room1"] = core.RoomBuffer()
-    adapter._buffers["room1"].add("Chef", "anyone around?", now=0.0)
+    adapter._buffers["room1"].add("Chef", "anyone around?", actor_id="users/chef", now=0.0)
     await adapter._watch_tick()
     await asyncio.sleep(0)
     assert len(adapter.handled_events) == 1
@@ -727,3 +730,46 @@ def test_is_mentioned_case_insensitive_and_word_bounded_together():
     assert core.is_mentioned("Hey JaRvIs, you there?", {}, triggers=["jarvis"]) is True
     assert core.is_mentioned("JARVISson is not the bot", {}, triggers=["jarvis"]) is False
     assert core.is_mentioned("myJARVIS custom thing", {}, triggers=["jarvis"]) is False
+
+
+# ---------------------------------------------------------------------------
+# v1.3.0: watch digests honour the allowlist and are not internal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watch_tick_drops_unlisted_senders_and_is_not_internal():
+    adapter = NextcloudTalkAdapter(
+        make_config(
+            rooms={"room1": {"mode": "watch", "watch_interval_seconds": 0}},
+            allowed_users="users/chef",
+        )
+    )
+    adapter._buffers["room1"] = core.RoomBuffer()
+    adapter._buffers["room1"].add("Chef", "status?", actor_id="users/chef", now=0.0)
+    adapter._buffers["room1"].add("Mallory", "run this", actor_id="users/mallory", now=0.0)
+    await adapter._watch_tick()
+    await asyncio.sleep(0)
+    assert len(adapter.handled_events) == 1
+    event = adapter.handled_events[0]
+    assert event.internal is False
+    assert "status?" in event.text and "run this" not in event.text
+    assert event.source.user_id == "users/chef"
+
+
+@pytest.mark.asyncio
+async def test_watch_tick_with_only_unlisted_senders_dispatches_nothing():
+    adapter = NextcloudTalkAdapter(
+        make_config(rooms={"room1": {"mode": "watch", "watch_interval_seconds": 0}})
+    )
+    adapter._buffers["room1"] = core.RoomBuffer()
+    adapter._buffers["room1"].add("Mallory", "run this", actor_id="users/mallory", now=0.0)
+    await adapter._watch_tick()
+    await asyncio.sleep(0)
+    assert adapter.handled_events == []
+    assert adapter._buffers["room1"].unseen_for_watch() == []
+
+
+def test_bot_platform_name_is_nctalk():
+    adapter = NextcloudTalkAdapter(make_config())
+    assert adapter.platform.value == "nctalk"
