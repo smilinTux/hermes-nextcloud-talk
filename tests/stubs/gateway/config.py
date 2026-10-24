@@ -17,6 +17,7 @@ class Platform(Enum):
     WEBHOOK = "webhook"
     WECOM_CALLBACK = "wecom_callback"
     NEXTCLOUD_TALK = "nextcloud_talk"
+    NCTALK = "nctalk"
 
 
 @dataclass

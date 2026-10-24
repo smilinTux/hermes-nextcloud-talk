@@ -259,6 +259,7 @@ class BufferedMessage:
     actor_name: str
     text: str
     watch_seen: bool = False
+    actor_id: str = ""
 
 
 class RoomBuffer:
@@ -274,9 +275,13 @@ class RoomBuffer:
         self._max_age = max_age_seconds
         self._messages: List[BufferedMessage] = []
 
-    def add(self, actor_name: str, text: str, *, now: Optional[float] = None) -> None:
+    def add(
+        self, actor_name: str, text: str, *, actor_id: str = "", now: Optional[float] = None
+    ) -> None:
         now = time.time() if now is None else now
-        self._messages.append(BufferedMessage(ts=now, actor_name=actor_name, text=text))
+        self._messages.append(
+            BufferedMessage(ts=now, actor_name=actor_name, text=text, actor_id=actor_id)
+        )
         self._trim(now)
 
     def _trim(self, now: float) -> None:
@@ -325,3 +330,21 @@ class WatchRateLimiter:
         hist.append(now)
         self._timestamps[room_token] = hist
         return True
+
+
+# ---------------------------------------------------------------------------
+# Sender allowlist (watch-mode digests)
+# ---------------------------------------------------------------------------
+
+
+def parse_allowlist(raw: Optional[str]) -> frozenset:
+    """Parse a comma-separated user-id allowlist to lowercase ids."""
+    return frozenset(s.strip().lower() for s in str(raw or "").split(",") if s.strip())
+
+
+def sender_allowed(actor_id: Optional[str], allowlist: frozenset, allow_all: bool) -> bool:
+    """True when ``allow_all`` is set or ``actor_id`` is on the allowlist."""
+    if allow_all:
+        return True
+    uid = (actor_id or "").strip().lower()
+    return bool(uid) and uid in allowlist

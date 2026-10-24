@@ -329,3 +329,25 @@ def test_watch_rate_limiter_is_per_room():
     now = 1000.0
     assert limiter.allow("room-1", now=now) is True
     assert limiter.allow("room-2", now=now) is True
+
+
+# -- sender allowlist ---------------------------------------------------
+
+
+def test_parse_allowlist_lowercases_and_skips_blanks():
+    assert core.parse_allowlist(" Alice, ,BOB ") == frozenset({"alice", "bob"})
+
+
+def test_sender_allowed_matches_case_insensitively():
+    assert core.sender_allowed("ALICE", frozenset({"alice"}), False)
+
+
+def test_sender_allowed_rejects_unlisted_and_empty_ids():
+    allow = frozenset({"alice"})
+    assert not core.sender_allowed("mallory", allow, False)
+    assert not core.sender_allowed("", allow, False)
+    assert not core.sender_allowed(None, frozenset(), False)
+
+
+def test_sender_allowed_allow_all_overrides_the_list():
+    assert core.sender_allowed("anyone", frozenset(), True)

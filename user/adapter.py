@@ -15,7 +15,7 @@ at startup.
 Configuration in config.yaml::
 
     platforms:
-      nextcloud_talk:
+      nctalk:
         enabled: true
         extra:
           server_url: "https://cloud.example.com"
@@ -78,6 +78,24 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+# Platform id. Not ``nextcloud_talk``: another author's Talk plugin in the
+# Hermes catalog registers that id, and two plugins claiming one id silently
+# replace each other. Env var names keep the NEXTCLOUD_TALK_ prefix.
+PLATFORM_NAME = "nctalk"
+
+try:  # Hermes resolves credentials per profile scope (multiplexed gateways)
+    from agent.secret_scope import get_secret as _hermes_get_secret
+except ImportError:  # pragma: no cover - older Hermes / test stubs
+    _hermes_get_secret = None
+
+
+def _secret(name: str, default: str = "") -> str:
+    """Read a credential through Hermes' secret scope, falling back to the env."""
+    if _hermes_get_secret is not None:
+        val = _hermes_get_secret(name, default)
+        return default if val is None else val
+    return os.getenv(name, default)
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -213,16 +231,29 @@ def _parse_room_modes_env(raw: Optional[str]) -> Dict[str, str]:
 def _room_mode(token: str, display_name: Optional[str], modes_map: Dict[str, str]) -> str:
     """Resolve the effective mode for a room.
 
-    A ``[watch]``/``[free]``/``[mention]`` prefix on the room's *display
-    name* always wins (an admin can flip it from inside Talk without
-    touching ``.env``); otherwise fall back to the ``token=mode`` map;
-    default is ``mention``.
+    Rooms not listed in the ``token=mode`` map are always ``mention``. For a
+    listed room, a ``[watch]``/``[free]``/``[mention]`` prefix on its
+    *display name* wins (an admin can flip it from inside Talk without
+    touching ``.env``); otherwise the map's value applies.
     """
+    if token not in modes_map:
+        # Only rooms the operator listed in NEXTCLOUD_TALK_ROOM_MODES may be
+        # re-moded from inside Talk; anyone can name a room "[watch] ...".
+        return ROOM_MODE_MENTION
     if display_name:
         match = _DISPLAY_MODE_PREFIX_RE.match(display_name)
         if match:
             return match.group(1).lower()
     return modes_map.get(token, ROOM_MODE_MENTION)
+
+
+def _parse_allowlist(raw: Optional[str]) -> frozenset:
+    """Parse ``NEXTCLOUD_TALK_ALLOWED_USERS`` to a set of lowercase user ids."""
+    return frozenset(s.strip().lower() for s in str(raw or "").split(",") if s.strip())
+
+
+def _truthy(raw: Any) -> bool:
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_agent_users(raw: Optional[str]) -> frozenset:
@@ -428,14 +459,14 @@ def check_requirements() -> bool:
     if not HTTPX_AVAILABLE:
         return False
     server = os.getenv("NEXTCLOUD_TALK_SERVER_URL", "").strip()
-    app_password = os.getenv("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
+    app_password = _secret("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
     return bool(server and app_password)
 
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     server = extra.get("server_url") or os.getenv("NEXTCLOUD_TALK_SERVER_URL", "")
-    app_password = extra.get("app_password") or os.getenv("NEXTCLOUD_TALK_APP_PASSWORD", "")
+    app_password = extra.get("app_password") or _secret("NEXTCLOUD_TALK_APP_PASSWORD", "")
     return bool(server and app_password)
 
 
@@ -454,7 +485,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
 
     def __init__(self, config: PlatformConfig):
-        platform = Platform("nextcloud_talk")
+        platform = Platform(PLATFORM_NAME)
         super().__init__(config=config, platform=platform)
 
         extra = config.extra or {}
@@ -467,8 +498,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._display_name: str = extra.get("display_name") or os.getenv(
             "NEXTCLOUD_TALK_DISPLAY_NAME", DEFAULT_DISPLAY_NAME
         )
-        self._app_password: str = extra.get("app_password") or os.getenv(
-            "NEXTCLOUD_TALK_APP_PASSWORD", ""
+        self._app_password: str = extra.get("app_password") or _secret("NEXTCLOUD_TALK_APP_PASSWORD", ""
         )
         self._allowed_inviters: List[str] = [
             s.strip()
@@ -516,6 +546,14 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._room_meta: Dict[str, Dict[str, Any]] = {}
         self._seen_messages: Dict[str, float] = {}
         self._watch_buffers: Dict[str, List[MessageEvent]] = {}
+        # Watch digests are filtered against the same allowlist the gateway
+        # applies, so an unlisted sender's text never rides in on a digest.
+        self._allowed_users = _parse_allowlist(
+            extra.get("allowed_users") or os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
+        )
+        self._allow_all_users = _truthy(
+            extra.get("allow_all_users") or os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
+        )
 
     # -- Connection lifecycle -------------------------------------------
 
@@ -765,11 +803,6 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             message_id=msg_id,
             raw_message=message,
             timestamp=self._parse_timestamp(message.get("timestamp")),
-            metadata={
-                "source_tag": _source_tag(self._server, token),
-                "mentioned": mentioned,
-                "room_mode": mode,
-            },
         )
 
         from_agent = _is_agent_actor(actor, self._agent_users)
@@ -801,7 +834,6 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         backlog = self._room_context.pop(token, [])
         if backlog:
             event.text = _with_room_context(text, backlog)
-            event.metadata["room_context_lines"] = len(backlog)
         if chat_type != "dm":
             event.text = _with_room_rules(event.text, room.get("description"))
         await self.handle_message(event)
@@ -844,21 +876,40 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 if not events:
                     continue
                 self._watch_buffers[token] = []
-                digest_text = "\n".join(f"- {e.source.user_name or e.source.user_id}: {e.text}" for e in events)
-                room = self._room_meta.get(token, {})
-                source = self.build_source(
-                    chat_id=token,
-                    chat_name=room.get("displayName") or room.get("name"),
-                    chat_type="group",
-                )
-                digest_event = MessageEvent(
-                    text=f"[watch-mode digest, {len(events)} message(s)]\n{digest_text}",
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    internal=True,
-                    metadata={"source_tag": _source_tag(self._server, token), "room_mode": ROOM_MODE_WATCH},
-                )
-                await self.handle_message(digest_event)
+                await self._dispatch_watch_digest(token, events)
+
+    def _sender_allowed(self, user_id: Optional[str]) -> bool:
+        if self._allow_all_users:
+            return True
+        uid = (user_id or "").strip().lower()
+        return bool(uid) and uid in self._allowed_users
+
+    async def _dispatch_watch_digest(self, token: str, events: List[MessageEvent]) -> None:
+        """Send one watch-mode digest as an ordinary inbound event.
+
+        Not ``internal``: the gateway's allowlist and pause gate apply. Lines
+        from senders outside the allowlist are dropped before the digest is
+        built; the digest is attributed to the last allowed sender.
+        """
+        allowed = [e for e in events if self._sender_allowed(e.source.user_id)]
+        if not allowed:
+            return
+        digest_text = "\n".join(f"- {e.source.user_name or e.source.user_id}: {e.text}" for e in allowed)
+        last = allowed[-1].source
+        room = self._room_meta.get(token, {})
+        source = self.build_source(
+            chat_id=token,
+            chat_name=room.get("displayName") or room.get("name"),
+            chat_type="group",
+            user_id=last.user_id,
+            user_name=last.user_name,
+        )
+        digest_event = MessageEvent(
+            text=f"[watch-mode digest, {len(allowed)} message(s)]\n{digest_text}",
+            message_type=MessageType.TEXT,
+            source=source,
+        )
+        await self.handle_message(digest_event)
 
     # -- Outbound messaging --------------------------------------------------
 
@@ -1004,7 +1055,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
 
 def _env_enablement() -> Optional[dict]:
     server = os.getenv("NEXTCLOUD_TALK_SERVER_URL", "").strip()
-    app_password = os.getenv("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
+    app_password = _secret("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
     if not server or not app_password:
         return None
     seed: dict = {
@@ -1032,14 +1083,14 @@ async def _standalone_send(
 ) -> Dict[str, Any]:
     """Out-of-process send for cron / send_message_tool when no live adapter exists."""
     if not HTTPX_AVAILABLE:
-        return {"error": "nextcloud_talk standalone send: httpx not installed"}
+        return {"error": "nctalk standalone send: httpx not installed"}
 
     extra = getattr(pconfig, "extra", {}) or {}
     server = (extra.get("server_url") or os.getenv("NEXTCLOUD_TALK_SERVER_URL", "")).rstrip("/")
     username = extra.get("username") or os.getenv("NEXTCLOUD_TALK_USERNAME", DEFAULT_USERNAME)
-    app_password = extra.get("app_password") or os.getenv("NEXTCLOUD_TALK_APP_PASSWORD", "")
+    app_password = extra.get("app_password") or _secret("NEXTCLOUD_TALK_APP_PASSWORD", "")
     if not server or not app_password:
-        return {"error": "nextcloud_talk standalone send: not configured"}
+        return {"error": "nctalk standalone send: not configured"}
 
     headers = _ocs_headers(username, app_password)
     chunks = _chunk_message(message)
@@ -1058,9 +1109,9 @@ async def _standalone_send(
                     last_id = resp.json().get("ocs", {}).get("data", {}).get("id")
                 except Exception:
                     pass
-        return {"success": True, "platform": "nextcloud_talk", "chat_id": chat_id, "message_id": last_id}
+        return {"success": True, "platform": PLATFORM_NAME, "chat_id": chat_id, "message_id": last_id}
     except Exception as e:
-        return {"error": f"nextcloud_talk standalone send failed: {e}"}
+        return {"error": f"nctalk standalone send failed: {e}"}
 
 
 def register(ctx) -> None:
@@ -1069,11 +1120,11 @@ def register(ctx) -> None:
     The combined repo's root ``register(ctx)`` picks between this module
     and ``bot/adapter.py`` automatically; this function exists so the
     ``user/`` directory also works as a self-contained plugin on its own
-    (copy it to ``~/.hermes/plugins/nextcloud_talk_user/`` with its own
+    (copy it to ``~/.hermes/plugins/nctalk_user/`` with its own
     ``plugin.yaml`` if you only want the real-user connector).
     """
     ctx.register_platform(
-        name="nextcloud_talk",
+        name=PLATFORM_NAME,
         label="Nextcloud Talk",
         adapter_factory=lambda cfg: NextcloudTalkUserAdapter(cfg),
         check_fn=check_requirements,

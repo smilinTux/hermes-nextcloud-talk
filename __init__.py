@@ -1,7 +1,7 @@
 """Unified Hermes plugin entry point for the Nextcloud Talk connectors.
 
 Two independent connectors live in this repo under one platform name
-(``nextcloud_talk``):
+(``nctalk``):
 
 - ``bot/``  -- a webhook bot (Nextcloud Talk Bot API, HMAC-SHA256 signed
   requests both directions). No Nextcloud user account; authorization is
@@ -50,9 +50,9 @@ def _mode(config) -> Optional[str]:
 
     extra = getattr(config, "extra", {}) or {} if config is not None else {}
     has_user = bool(
-        extra.get("app_password") or os.getenv("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
+        extra.get("app_password") or _user._secret("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
     )
-    has_bot = bool(extra.get("secret") or os.getenv("NEXTCLOUD_TALK_SECRET", "").strip())
+    has_bot = bool(extra.get("secret") or _user._secret("NEXTCLOUD_TALK_SECRET", "").strip())
 
     if has_user and not has_bot:
         return "user"
@@ -94,7 +94,7 @@ async def standalone_send(pconfig, chat_id, message, **kwargs):
         return await _user._standalone_send(pconfig, chat_id, message, **kwargs)
     return {
         "error": (
-            "nextcloud_talk standalone send: the bot connector has no "
+            "nctalk standalone send: the bot connector has no "
             "standalone sender (it only replies from a live webhook turn). "
             "Configure NEXTCLOUD_TALK_APP_PASSWORD for the user connector, "
             "or send from the live gateway adapter instead."
@@ -105,7 +105,7 @@ async def standalone_send(pconfig, chat_id, message, **kwargs):
 def register(ctx) -> None:
     """Plugin entry point -- called once by the Hermes plugin loader at startup."""
     ctx.register_platform(
-        name="nextcloud_talk",
+        name=_user.PLATFORM_NAME,
         label="Nextcloud Talk",
         adapter_factory=adapter_factory,
         check_fn=check_requirements,
