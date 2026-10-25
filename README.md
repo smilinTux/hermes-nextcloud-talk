@@ -184,6 +184,14 @@ tool-progress message that updates as it works (set
 is posted). When someone edits or deletes a message the agent is holding as
 context, its context follows.
 
+### Nextcloud tools (optional)
+
+The plugin puts the agent *in* Talk. To let it also read Nextcloud files,
+calendars, contacts, Deck boards and more, add a Nextcloud MCP server to
+Hermes. See [docs/nextcloud-mcp.md](docs/nextcloud-mcp.md) for a tested config
+that reuses this plugin's credentials and a read-only tool allowlist to start
+with.
+
 ### Federation (user mode)
 
 Nextcloud Talk supports inviting a user on another federated server into
