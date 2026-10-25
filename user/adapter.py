@@ -68,7 +68,11 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+import json
+import mimetypes
+import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 try:
     import httpx
@@ -102,6 +106,10 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
+    cache_video_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -339,6 +347,72 @@ def _resolve_mention_placeholders(text: str, parameters: Optional[Dict[str, Any]
         return match.group(0)
 
     return re.sub(r"\{(mention-[a-zA-Z0-9_-]+)\}", _sub, text)
+
+
+# -- Shared files (Talk "file" rich objects) ----------------------------------
+
+# Hermes' document cap for chat uploads; Talk itself allows far larger shares.
+MAX_INBOUND_FILE_BYTES = 20 * 1024 * 1024
+# Small text files are inlined so the model reads them without a tool call.
+MAX_INLINE_TEXT_BYTES = 100 * 1024
+_TEXT_EXTENSIONS = frozenset({
+    ".txt", ".md", ".csv", ".tsv", ".json", ".yaml", ".yml", ".xml", ".log",
+    ".py", ".js", ".ts", ".sh", ".toml", ".ini", ".cfg", ".html", ".css", ".sql",
+})
+# Where outbound files are uploaded in the agent's own Files before sharing.
+OUTBOUND_FOLDER = "Talk"
+
+
+def _file_parameters(parameters: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The ``file`` rich objects of a Talk message, in placeholder order."""
+    if not parameters:
+        return []
+    return [
+        p for key, p in sorted(parameters.items())
+        if isinstance(p, dict) and p.get("type") == "file" and key.startswith("file")
+    ]
+
+
+def _describe_file(param: Dict[str, Any]) -> str:
+    name = param.get("name") or "file"
+    mime = param.get("mimetype") or "unknown type"
+    return f"[file: {name} ({mime})]"
+
+
+def _resolve_file_placeholders(text: str, parameters: Optional[Dict[str, Any]]) -> str:
+    """Replace ``{file}`` placeholders with a readable ``[file: name (type)]``.
+
+    A share with no caption arrives as the bare text ``{file}``; with a
+    caption the text is the caption and the file is only in the parameters,
+    so it is appended rather than lost.
+    """
+    files = _file_parameters(parameters)
+    if not files:
+        return text
+    named = {key: p for key, p in (parameters or {}).items()
+             if isinstance(p, dict) and p.get("type") == "file"}
+    used = set()
+
+    def _sub(match: "re.Match[str]") -> str:
+        param = named.get(match.group(1))
+        if param is None:
+            return match.group(0)
+        used.add(match.group(1))
+        return _describe_file(param)
+
+    out = re.sub(r"\{(file[a-zA-Z0-9_-]*)\}", _sub, text)
+    extra = [_describe_file(p) for key, p in sorted(named.items()) if key not in used]
+    return " ".join([out] + extra).strip() if extra else out
+
+
+def _media_kind(mime: str, is_voice: bool) -> str:
+    mime = (mime or "").lower()
+    if is_voice:
+        return "voice"
+    for prefix in ("image", "audio", "video"):
+        if mime.startswith(prefix + "/"):
+            return prefix
+    return "document"
 
 
 def _strip_leading_self_mention(text: str, own_user_id: str, own_display_name: str) -> str:
@@ -855,6 +929,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             text, message.get("messageParameters"), self._username, self._display_name
         )
         text = _resolve_mention_placeholders(text, message.get("messageParameters"))
+        text = _resolve_file_placeholders(text, message.get("messageParameters"))
+        shared_files = _file_parameters(message.get("messageParameters"))
         if mentioned:
             bare = _strip_leading_self_mention(text, self._username, self._display_name)
             if bare.startswith("/"):
@@ -912,6 +988,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # (Operators AI, 2026-10-25). A human's mention still expects a reply.
             event.reply_expected = False
 
+        if shared_files:
+            await self._attach_files(event, shared_files, message)
+
         if is_command:
             # Slash commands (/sethome, /new ...) go to the core verbatim: any
             # prefix would stop it recognising the command. Backlog is kept
@@ -927,6 +1006,89 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # operator listed (or an explicit opt-in) may hand the agent rules.
             event.text = _with_room_rules(event.text, room.get("description"))
         await self.handle_message(event)
+
+    async def _attach_files(
+        self, event: MessageEvent, files: List[Dict[str, Any]], message: Dict[str, Any]
+    ) -> None:
+        """Download shared files into Hermes' media cache and attach them to *event*.
+
+        Only runs for a message the agent is about to answer, never for the
+        backlog of a listening room. A file the account cannot read (a share
+        from a federated room has no path on this server) or one over the size
+        cap becomes a notice instead, so the model knows something was sent.
+        """
+        is_voice = message.get("messageType") == "voice-message"
+        notices: List[str] = []
+        for param in files:
+            name = param.get("name") or "file"
+            mime = param.get("mimetype") or mimetypes.guess_type(name)[0] or "application/octet-stream"
+            path = param.get("path")
+            try:
+                size = int(param.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if not path:
+                notices.append(f"{name}: not reachable from this account (shared from another server)")
+                continue
+            if size > MAX_INBOUND_FILE_BYTES:
+                notices.append(f"{name}: {size // (1024 * 1024)} MB is over the 20 MB limit")
+                continue
+            data = await self._download_own_file(path)
+            if data is None:
+                notices.append(f"{name}: download failed")
+                continue
+            kind = _media_kind(mime, is_voice)
+            ext = os.path.splitext(name)[1].lower() or (mimetypes.guess_extension(mime) or "")
+            try:
+                if kind == "image":
+                    cached = cache_image_from_bytes(data, ext=ext or ".jpg")
+                    event.message_type = MessageType.PHOTO
+                elif kind in ("voice", "audio"):
+                    cached = cache_audio_from_bytes(data, ext=ext or ".ogg")
+                    event.message_type = MessageType.VOICE if kind == "voice" else MessageType.AUDIO
+                elif kind == "video":
+                    cached = cache_video_from_bytes(data, ext=ext or ".mp4")
+                    event.message_type = MessageType.VIDEO
+                else:
+                    cached = cache_document_from_bytes(data, name)
+                    event.message_type = MessageType.DOCUMENT
+            except Exception as e:
+                logger.warning("[%s] caching %s failed: %s", self.name, name, e)
+                notices.append(f"{name}: could not be cached")
+                continue
+            inlined = False
+            if kind == "document" and len(data) <= MAX_INLINE_TEXT_BYTES and (
+                    ext in _TEXT_EXTENSIONS or mime.startswith("text/")):
+                try:
+                    safe = re.sub(r"[^\w.\- ]", "_", name)
+                    event.text = f"[Content of {safe}]:\n{data.decode('utf-8')}\n\n{event.text}"
+                    inlined = True
+                except UnicodeDecodeError:
+                    pass
+            event.media_urls.append(cached)
+            event.media_types.append(mime)
+            if hasattr(event, "media_text_inlined"):
+                event.media_text_inlined.append(inlined)
+        if notices:
+            block = "[Talk attachment notice]\n" + "\n".join(f"- {n}" for n in notices)
+            event.text = f"{block}\n\n{event.text}"
+
+    async def _download_own_file(self, path: str) -> Optional[bytes]:
+        """GET a file from the agent's own Files over WebDAV (the share's path)."""
+        if not self._http_client:
+            return None
+        url = f"/remote.php/dav/files/{quote(self._username)}/{quote(path.lstrip('/'))}"
+        try:
+            resp = await self._http_client.get(url)
+        except Exception as e:
+            logger.warning("[%s] WebDAV GET %s failed: %s", self.name, path, e)
+            return None
+        if resp.status_code != 200:
+            logger.warning("[%s] WebDAV GET %s: HTTP %s", self.name, path, resp.status_code)
+            return None
+        if len(resp.content) > MAX_INBOUND_FILE_BYTES:
+            return None
+        return resp.content
 
     def _remember(
         self, token: str, actor: Dict[str, Optional[str]], text: str, msg_id: Optional[str] = None

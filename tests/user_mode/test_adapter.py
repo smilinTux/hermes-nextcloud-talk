@@ -971,3 +971,87 @@ def test_edit_of_an_unknown_message_is_ignored():
     ghost = _talk_message("99", "chefboyrdave2.1", "never seen")
     _run(adapter._on_message("tok1", _system("100", "message_edited", ghost)))
     assert adapter._room_context.get("tok1") in (None, [])
+
+
+# -- Shared files inbound ---------------------------------------------------
+
+from user.adapter import _resolve_file_placeholders  # noqa: E402
+
+_FILE = {"type": "file", "id": "8795078", "name": "spike.txt", "size": "34",
+         "path": "Talk/spike.txt", "mimetype": "text/plain"}
+
+
+def test_bare_file_share_becomes_a_readable_marker():
+    assert _resolve_file_placeholders("{file}", {"file": _FILE}) == "[file: spike.txt (text/plain)]"
+
+
+def test_captioned_share_keeps_caption_and_appends_the_file():
+    assert _resolve_file_placeholders("see this", {"file": _FILE}) == "see this [file: spike.txt (text/plain)]"
+
+
+def _files_adapter(handler, **extra):
+    extra.setdefault("room_modes", "tok1=free")
+    adapter = _make_adapter(allow_all_users=True, **extra)
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "ops"}
+    adapter._http_client = httpx.AsyncClient(
+        base_url="https://skhub.example", transport=httpx.MockTransport(handler))
+    return adapter
+
+
+def test_text_file_is_downloaded_cached_and_inlined():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, content=b"hello from the spike\n")
+
+    adapter = _files_adapter(handler)
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", params={"file": _FILE})))
+    event = adapter.handled_events[0]
+    assert seen == ["/remote.php/dav/files/hermes-bot/Talk/spike.txt"]
+    assert event.message_type.value == "document"
+    assert event.media_types == ["text/plain"] and len(event.media_urls) == 1
+    assert event.media_text_inlined == [True]
+    assert event.text.startswith("[Content of spike.txt]:\nhello from the spike")
+
+
+def test_image_attaches_as_photo_without_inlining():
+    img = dict(_FILE, name="cat.png", mimetype="image/png", path="Talk/cat.png")
+    adapter = _files_adapter(lambda r: httpx.Response(200, content=b"\x89PNG..."))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "look", params={"file": img})))
+    event = adapter.handled_events[0]
+    assert event.message_type.value == "photo"
+    assert event.media_types == ["image/png"] and event.media_text_inlined == [False]
+    assert event.text == "look [file: cat.png (image/png)]"
+
+
+def test_voice_message_goes_to_stt_as_voice():
+    voice = dict(_FILE, name="Talk recording.mp3", mimetype="audio/mpeg", path="Talk/rec.mp3")
+    msg = _talk_message("1", "dave", "{file}", params={"file": voice})
+    msg["messageType"] = "voice-message"
+    adapter = _files_adapter(lambda r: httpx.Response(200, content=b"ID3..."))
+    _run(adapter._on_message("tok1", msg))
+    assert adapter.handled_events[0].message_type.value == "voice"
+
+
+def test_file_from_another_server_becomes_a_notice():
+    remote = dict(_FILE, path=None)
+    adapter = _files_adapter(lambda r: pytest.fail("must not download"))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", params={"file": remote})))
+    event = adapter.handled_events[0]
+    assert event.media_urls == []
+    assert event.text.startswith("[Talk attachment notice]\n- spike.txt: not reachable")
+
+
+def test_oversized_file_is_not_downloaded():
+    big = dict(_FILE, size=str(25 * 1024 * 1024))
+    adapter = _files_adapter(lambda r: pytest.fail("must not download"))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", params={"file": big})))
+    assert "over the 20 MB limit" in adapter.handled_events[0].text
+
+
+def test_files_in_a_listening_room_are_not_downloaded():
+    adapter = _files_adapter(lambda r: pytest.fail("must not download"), room_modes="tok1=mention")
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", display_name="Dave", params={"file": _FILE})))
+    assert adapter.handled_events == []
+    assert adapter._room_context["tok1"] == ["Dave: [file: spike.txt (text/plain)]"]
