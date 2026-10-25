@@ -4,6 +4,27 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.6.0] - 2026-10-25
+
+### Added
+
+- Shared files reach the agent. `{file}` placeholders become
+  `[file: name (type)]` in text and in the listening backlog. For a message the
+  agent answers, each file is downloaded over WebDAV from the account's own
+  Files and attached through Hermes' media cache: images as PHOTO (vision),
+  voice messages as VOICE (speech-to-text), audio, video and documents, with
+  small text files inlined. Files with no local path (shared from a federated
+  room) or over 20 MB become an attachment notice. Files in rooms the agent is
+  only listening to are never downloaded.
+- The agent can send files: `send_image` (URL), `send_image_file`,
+  `send_animation`, `send_video`, `send_document` and `send_voice` upload to
+  `Talk/<unique folder>/<name>` in the agent's Files and share into the room,
+  with caption and reply-to; `send_voice` posts a Talk voice message.
+- `NEXTCLOUD_TALK_FEDERATED_MEDIA=link`: Talk cannot share files into a
+  federated conversation, so this posts a read-only public link that expires
+  after 7 days instead. Off by default, since anyone holding the link can read
+  the file.
+
 ## [1.5.0] - 2026-10-25
 
 ### Added

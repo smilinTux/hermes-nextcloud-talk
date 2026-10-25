@@ -20,6 +20,11 @@ from typing import Any, Dict, List, Optional
 
 class MessageType(Enum):
     TEXT = "text"
+    PHOTO = "photo"
+    VIDEO = "video"
+    AUDIO = "audio"
+    VOICE = "voice"
+    DOCUMENT = "document"
 
 
 class ProcessingOutcome(Enum):
@@ -52,6 +57,9 @@ class MessageEvent:
     timestamp: Any = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
     reply_expected: Optional[bool] = None
+    media_urls: List[str] = field(default_factory=list)
+    media_types: List[str] = field(default_factory=list)
+    media_text_inlined: List[Optional[bool]] = field(default_factory=list)
 
 
 @dataclass
@@ -137,6 +145,11 @@ class BasePlatformAdapter:
     async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> "SendResult":
         return SendResult(success=False, error="Not supported")
 
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
+        # Real base: post the URL (with caption) as text.
+        text = f"{caption}\n{image_url}" if caption else image_url
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
     async def delete_message(self, chat_id, message_id) -> bool:
         return False
 
@@ -157,3 +170,34 @@ class BasePlatformAdapter:
         if remaining:
             chunks.append(remaining)
         return chunks
+
+
+# Media cache helpers (real ones live in gateway.platforms.base / media_cache):
+# write to a temp dir and return the path, which is all an adapter relies on.
+import os as _os
+import tempfile as _tempfile
+
+_CACHE_DIR = _tempfile.mkdtemp(prefix="nctalk-stub-cache-")
+
+
+def _stub_cache(data: bytes, name: str) -> str:
+    path = _os.path.join(_CACHE_DIR, f"{len(_os.listdir(_CACHE_DIR))}-{name}")
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
+    return _stub_cache(data, "image" + ext)
+
+
+def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
+    return _stub_cache(data, "audio" + ext)
+
+
+def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
+    return _stub_cache(data, "video" + ext)
+
+
+def cache_document_from_bytes(data: bytes, filename: str) -> str:
+    return _stub_cache(data, filename)

@@ -159,6 +159,31 @@ before *that* timeout comes back as a connection error instead of a plain
 `NEXTCLOUD_TALK_LONG_POLL_TIMEOUT` a few seconds under your front door's
 timeout (or raise it back to `30` if nothing sits in front of Hermes).
 
+### Files, images and voice (user mode)
+
+Files shared in a room reach the agent: images go to vision, voice messages to
+speech-to-text, small text files are inlined, other documents, audio and video
+are attached. Only messages the agent answers trigger a download; files in a
+room it is just listening to show up as `[file: name (type)]` in its context.
+The cap is 20 MB per file.
+
+The agent can send files too. They are uploaded to `Talk/<unique folder>/` in
+the agent account's own Files and shared into the room, so give the account
+some storage quota. Voice replies arrive as Talk voice messages.
+
+Talk cannot share files into a federated conversation. Set
+`NEXTCLOUD_TALK_FEDERATED_MEDIA=link` to post a read-only public link that
+expires after 7 days instead; it is off by default because anyone holding the
+link can read the file.
+
+### Editing (user mode)
+
+The agent edits its own messages, which is what lets Hermes show one
+tool-progress message that updates as it works (set
+`display.platforms.nctalk.cleanup_progress: true` to delete it once the answer
+is posted). When someone edits or deletes a message the agent is holding as
+context, its context follows.
+
 ### Federation (user mode)
 
 Nextcloud Talk supports inviting a user on another federated server into

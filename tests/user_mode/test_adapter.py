@@ -971,3 +971,170 @@ def test_edit_of_an_unknown_message_is_ignored():
     ghost = _talk_message("99", "chefboyrdave2.1", "never seen")
     _run(adapter._on_message("tok1", _system("100", "message_edited", ghost)))
     assert adapter._room_context.get("tok1") in (None, [])
+
+
+# -- Shared files inbound ---------------------------------------------------
+
+from user.adapter import _resolve_file_placeholders  # noqa: E402
+
+_FILE = {"type": "file", "id": "8795078", "name": "spike.txt", "size": "34",
+         "path": "Talk/spike.txt", "mimetype": "text/plain"}
+
+
+def test_bare_file_share_becomes_a_readable_marker():
+    assert _resolve_file_placeholders("{file}", {"file": _FILE}) == "[file: spike.txt (text/plain)]"
+
+
+def test_captioned_share_keeps_caption_and_appends_the_file():
+    assert _resolve_file_placeholders("see this", {"file": _FILE}) == "see this [file: spike.txt (text/plain)]"
+
+
+def _files_adapter(handler, **extra):
+    extra.setdefault("room_modes", "tok1=free")
+    adapter = _make_adapter(allow_all_users=True, **extra)
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "ops"}
+    adapter._http_client = httpx.AsyncClient(
+        base_url="https://skhub.example", transport=httpx.MockTransport(handler))
+    return adapter
+
+
+def test_text_file_is_downloaded_cached_and_inlined():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, content=b"hello from the spike\n")
+
+    adapter = _files_adapter(handler)
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", params={"file": _FILE})))
+    event = adapter.handled_events[0]
+    assert seen == ["/remote.php/dav/files/hermes-bot/Talk/spike.txt"]
+    assert event.message_type.value == "document"
+    assert event.media_types == ["text/plain"] and len(event.media_urls) == 1
+    assert event.media_text_inlined == [True]
+    assert event.text.startswith("[Content of spike.txt]:\nhello from the spike")
+
+
+def test_image_attaches_as_photo_without_inlining():
+    img = dict(_FILE, name="cat.png", mimetype="image/png", path="Talk/cat.png")
+    adapter = _files_adapter(lambda r: httpx.Response(200, content=b"\x89PNG..."))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "look", params={"file": img})))
+    event = adapter.handled_events[0]
+    assert event.message_type.value == "photo"
+    assert event.media_types == ["image/png"] and event.media_text_inlined == [False]
+    assert event.text == "look [file: cat.png (image/png)]"
+
+
+def test_voice_message_goes_to_stt_as_voice():
+    voice = dict(_FILE, name="Talk recording.mp3", mimetype="audio/mpeg", path="Talk/rec.mp3")
+    msg = _talk_message("1", "dave", "{file}", params={"file": voice})
+    msg["messageType"] = "voice-message"
+    adapter = _files_adapter(lambda r: httpx.Response(200, content=b"ID3..."))
+    _run(adapter._on_message("tok1", msg))
+    assert adapter.handled_events[0].message_type.value == "voice"
+
+
+def test_file_from_another_server_becomes_a_notice():
+    remote = dict(_FILE, path=None)
+    adapter = _files_adapter(lambda r: pytest.fail("must not download"))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", params={"file": remote})))
+    event = adapter.handled_events[0]
+    assert event.media_urls == []
+    assert event.text.startswith("[Talk attachment notice]\n- spike.txt: not reachable")
+
+
+def test_oversized_file_is_not_downloaded():
+    big = dict(_FILE, size=str(25 * 1024 * 1024))
+    adapter = _files_adapter(lambda r: pytest.fail("must not download"))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", params={"file": big})))
+    assert "over the 20 MB limit" in adapter.handled_events[0].text
+
+
+def test_files_in_a_listening_room_are_not_downloaded():
+    adapter = _files_adapter(lambda r: pytest.fail("must not download"), room_modes="tok1=mention")
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", display_name="Dave", params={"file": _FILE})))
+    assert adapter.handled_events == []
+    assert adapter._room_context["tok1"] == ["Dave: [file: spike.txt (text/plain)]"]
+
+
+# -- Outbound media ---------------------------------------------------------
+
+from urllib.parse import parse_qs  # noqa: E402
+
+
+def _recording_adapter(responses=None, federated=False, **extra):
+    calls = []
+
+    def handler(request):
+        body = request.content
+        calls.append((request.method, request.url.path, body))
+        if request.url.path.endswith("/shares"):
+            form = parse_qs(body.decode())
+            if form.get("shareType") == ["3"]:
+                return httpx.Response(200, json={"ocs": {"data": {"url": "https://skhub.example/s/abc"}}})
+            return httpx.Response(200, json={"ocs": {"data": {"id": 90}}})
+        if request.method == "MKCOL":
+            return httpx.Response(405)
+        if request.method == "PUT":
+            return httpx.Response(201)
+        return httpx.Response(201, json={"ocs": {"data": {"id": 777}}})
+
+    adapter = _make_adapter(**extra)
+    room = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "ops"}
+    if federated:
+        room["remoteServer"] = "https://other.example"
+    adapter._room_meta["tok1"] = room
+    adapter._http_client = httpx.AsyncClient(base_url="https://skhub.example", transport=httpx.MockTransport(handler))
+    return adapter, calls
+
+
+def test_document_is_uploaded_then_shared_into_the_room(tmp_path):
+    f = tmp_path / "report.pdf"
+    f.write_bytes(b"%PDF-1.7")
+    adapter, calls = _recording_adapter()
+    result = _run(adapter.send_document("tok1", str(f), caption="Q3 numbers", reply_to="42"))
+    assert result.success
+    methods = [c[0] for c in calls]
+    assert methods == ["MKCOL", "MKCOL", "PUT", "POST"]
+    assert calls[2][1].startswith("/remote.php/dav/files/hermes-bot/Talk/") and calls[2][1].endswith("/report.pdf")
+    assert calls[2][2] == b"%PDF-1.7"
+    form = parse_qs(calls[3][2].decode())
+    assert form["shareType"] == ["10"] and form["shareWith"] == ["tok1"]
+    assert json.loads(form["talkMetaData"][0]) == {"caption": "Q3 numbers", "replyTo": 42}
+
+
+def test_voice_is_shared_as_a_talk_voice_message(tmp_path):
+    f = tmp_path / "reply.ogg"
+    f.write_bytes(b"OggS")
+    adapter, calls = _recording_adapter()
+    assert _run(adapter.send_voice("tok1", str(f))).success
+    form = parse_qs(calls[3][2].decode())
+    assert json.loads(form["talkMetaData"][0]) == {"messageType": "voice-message"}
+
+
+def test_federated_room_refuses_by_default_without_uploading(tmp_path):
+    f = tmp_path / "a.png"
+    f.write_bytes(b"\x89PNG")
+    adapter, calls = _recording_adapter(federated=True)
+    result = _run(adapter.send_image_file("tok1", str(f)))
+    assert result.success is False and "federated" in result.error
+    assert calls == []
+
+
+def test_federated_room_with_link_mode_posts_an_expiring_link(tmp_path):
+    f = tmp_path / "a.png"
+    f.write_bytes(b"\x89PNG")
+    adapter, calls = _recording_adapter(federated=True, federated_media="link")
+    assert _run(adapter.send_image_file("tok1", str(f), caption="chart")).success
+    share_form = parse_qs(calls[3][2].decode())
+    assert share_form["shareType"] == ["3"] and share_form["permissions"] == ["1"] and "expireDate" in share_form
+    chat = json.loads(calls[4][2])
+    assert calls[4][1] == "/ocs/v2.php/apps/spreed/api/v1/chat/tok1"
+    assert chat["message"].startswith("chart\n📎 a.png (link expires ") and chat["message"].endswith("https://skhub.example/s/abc")
+
+
+def test_unfetchable_image_url_falls_back_to_posting_the_url():
+    adapter, calls = _recording_adapter()
+    result = _run(adapter.send_image("tok1", "ftp://nope/x.png", caption="pic"))
+    assert result.success
+    assert [c[0] for c in calls] == ["POST"] and json.loads(calls[0][2])["message"] == "pic\nftp://nope/x.png"

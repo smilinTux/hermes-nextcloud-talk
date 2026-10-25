@@ -30,6 +30,8 @@ Environment variables (env wins over config.yaml ``extra``):
     NEXTCLOUD_TALK_DISPLAY_NAME             Display name for plain-text mentions (default: Hermes)
     NEXTCLOUD_TALK_ALLOWED_INVITERS        Federation inviters to auto-accept from
     NEXTCLOUD_TALK_ROOM_MODES              "token1=mention,token2=watch,token3=free"
+    NEXTCLOUD_TALK_FEDERATED_MEDIA         "link" posts an expiring public link for files in federated
+                                             rooms (Talk cannot share into them); default "off"
     NEXTCLOUD_TALK_ALLOWED_USERS           Allowlist (gateway auth integration)
     NEXTCLOUD_TALK_ALLOW_ALL_USERS         Allow any user -- dev only
     NEXTCLOUD_TALK_HOME_CHANNEL            Default room token for cron delivery
@@ -68,7 +70,11 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+import json
+import mimetypes
+import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 try:
     import httpx
@@ -102,6 +108,10 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
+    cache_video_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -339,6 +349,74 @@ def _resolve_mention_placeholders(text: str, parameters: Optional[Dict[str, Any]
         return match.group(0)
 
     return re.sub(r"\{(mention-[a-zA-Z0-9_-]+)\}", _sub, text)
+
+
+# -- Shared files (Talk "file" rich objects) ----------------------------------
+
+# Hermes' document cap for chat uploads; Talk itself allows far larger shares.
+MAX_INBOUND_FILE_BYTES = 20 * 1024 * 1024
+# Small text files are inlined so the model reads them without a tool call.
+MAX_INLINE_TEXT_BYTES = 100 * 1024
+_TEXT_EXTENSIONS = frozenset({
+    ".txt", ".md", ".csv", ".tsv", ".json", ".yaml", ".yml", ".xml", ".log",
+    ".py", ".js", ".ts", ".sh", ".toml", ".ini", ".cfg", ".html", ".css", ".sql",
+})
+# Where outbound files are uploaded in the agent's own Files before sharing.
+OUTBOUND_FOLDER = "Talk"
+FEDERATED_MEDIA_ENV = "NEXTCLOUD_TALK_FEDERATED_MEDIA"
+FEDERATED_LINK_DAYS = 7
+
+
+def _file_parameters(parameters: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The ``file`` rich objects of a Talk message, in placeholder order."""
+    if not parameters:
+        return []
+    return [
+        p for key, p in sorted(parameters.items())
+        if isinstance(p, dict) and p.get("type") == "file" and key.startswith("file")
+    ]
+
+
+def _describe_file(param: Dict[str, Any]) -> str:
+    name = param.get("name") or "file"
+    mime = param.get("mimetype") or "unknown type"
+    return f"[file: {name} ({mime})]"
+
+
+def _resolve_file_placeholders(text: str, parameters: Optional[Dict[str, Any]]) -> str:
+    """Replace ``{file}`` placeholders with a readable ``[file: name (type)]``.
+
+    A share with no caption arrives as the bare text ``{file}``; with a
+    caption the text is the caption and the file is only in the parameters,
+    so it is appended rather than lost.
+    """
+    files = _file_parameters(parameters)
+    if not files:
+        return text
+    named = {key: p for key, p in (parameters or {}).items()
+             if isinstance(p, dict) and p.get("type") == "file"}
+    used = set()
+
+    def _sub(match: "re.Match[str]") -> str:
+        param = named.get(match.group(1))
+        if param is None:
+            return match.group(0)
+        used.add(match.group(1))
+        return _describe_file(param)
+
+    out = re.sub(r"\{(file[a-zA-Z0-9_-]*)\}", _sub, text)
+    extra = [_describe_file(p) for key, p in sorted(named.items()) if key not in used]
+    return " ".join([out] + extra).strip() if extra else out
+
+
+def _media_kind(mime: str, is_voice: bool) -> str:
+    mime = (mime or "").lower()
+    if is_voice:
+        return "voice"
+    for prefix in ("image", "audio", "video"):
+        if mime.startswith(prefix + "/"):
+            return prefix
+    return "document"
 
 
 def _strip_leading_self_mention(text: str, own_user_id: str, own_display_name: str) -> str:
@@ -587,6 +665,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         # room token -> {message id: its line in _room_context}, so an edit or
         # deletion of a still-unanswered message updates the backlog in place
         self._room_context_ids: Dict[str, Dict[str, str]] = {}
+        # Talk cannot share a file into a federated conversation. "link" uploads
+        # to the agent's own Files and posts an expiring public link instead;
+        # off by default because a public link is readable by anyone who has it.
+        self._federated_media: str = str(
+            extra.get("federated_media") or os.getenv(FEDERATED_MEDIA_ENV, "off")
+        ).strip().lower()
         # room token -> agent messages seen in a row since the last human message
         self._agent_chain: Dict[str, int] = {}
         self._discovery_interval: float = float(
@@ -855,6 +939,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             text, message.get("messageParameters"), self._username, self._display_name
         )
         text = _resolve_mention_placeholders(text, message.get("messageParameters"))
+        text = _resolve_file_placeholders(text, message.get("messageParameters"))
+        shared_files = _file_parameters(message.get("messageParameters"))
         if mentioned:
             bare = _strip_leading_self_mention(text, self._username, self._display_name)
             if bare.startswith("/"):
@@ -912,6 +998,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # (Operators AI, 2026-10-25). A human's mention still expects a reply.
             event.reply_expected = False
 
+        if shared_files:
+            await self._attach_files(event, shared_files, message)
+
         if is_command:
             # Slash commands (/sethome, /new ...) go to the core verbatim: any
             # prefix would stop it recognising the command. Backlog is kept
@@ -927,6 +1016,89 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # operator listed (or an explicit opt-in) may hand the agent rules.
             event.text = _with_room_rules(event.text, room.get("description"))
         await self.handle_message(event)
+
+    async def _attach_files(
+        self, event: MessageEvent, files: List[Dict[str, Any]], message: Dict[str, Any]
+    ) -> None:
+        """Download shared files into Hermes' media cache and attach them to *event*.
+
+        Only runs for a message the agent is about to answer, never for the
+        backlog of a listening room. A file the account cannot read (a share
+        from a federated room has no path on this server) or one over the size
+        cap becomes a notice instead, so the model knows something was sent.
+        """
+        is_voice = message.get("messageType") == "voice-message"
+        notices: List[str] = []
+        for param in files:
+            name = param.get("name") or "file"
+            mime = param.get("mimetype") or mimetypes.guess_type(name)[0] or "application/octet-stream"
+            path = param.get("path")
+            try:
+                size = int(param.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if not path:
+                notices.append(f"{name}: not reachable from this account (shared from another server)")
+                continue
+            if size > MAX_INBOUND_FILE_BYTES:
+                notices.append(f"{name}: {size // (1024 * 1024)} MB is over the 20 MB limit")
+                continue
+            data = await self._download_own_file(path)
+            if data is None:
+                notices.append(f"{name}: download failed")
+                continue
+            kind = _media_kind(mime, is_voice)
+            ext = os.path.splitext(name)[1].lower() or (mimetypes.guess_extension(mime) or "")
+            try:
+                if kind == "image":
+                    cached = cache_image_from_bytes(data, ext=ext or ".jpg")
+                    event.message_type = MessageType.PHOTO
+                elif kind in ("voice", "audio"):
+                    cached = cache_audio_from_bytes(data, ext=ext or ".ogg")
+                    event.message_type = MessageType.VOICE if kind == "voice" else MessageType.AUDIO
+                elif kind == "video":
+                    cached = cache_video_from_bytes(data, ext=ext or ".mp4")
+                    event.message_type = MessageType.VIDEO
+                else:
+                    cached = cache_document_from_bytes(data, name)
+                    event.message_type = MessageType.DOCUMENT
+            except Exception as e:
+                logger.warning("[%s] caching %s failed: %s", self.name, name, e)
+                notices.append(f"{name}: could not be cached")
+                continue
+            inlined = False
+            if kind == "document" and len(data) <= MAX_INLINE_TEXT_BYTES and (
+                    ext in _TEXT_EXTENSIONS or mime.startswith("text/")):
+                try:
+                    safe = re.sub(r"[^\w.\- ]", "_", name)
+                    event.text = f"[Content of {safe}]:\n{data.decode('utf-8')}\n\n{event.text}"
+                    inlined = True
+                except UnicodeDecodeError:
+                    pass
+            event.media_urls.append(cached)
+            event.media_types.append(mime)
+            if hasattr(event, "media_text_inlined"):
+                event.media_text_inlined.append(inlined)
+        if notices:
+            block = "[Talk attachment notice]\n" + "\n".join(f"- {n}" for n in notices)
+            event.text = f"{block}\n\n{event.text}"
+
+    async def _download_own_file(self, path: str) -> Optional[bytes]:
+        """GET a file from the agent's own Files over WebDAV (the share's path)."""
+        if not self._http_client:
+            return None
+        url = f"/remote.php/dav/files/{quote(self._username)}/{quote(path.lstrip('/'))}"
+        try:
+            resp = await self._http_client.get(url)
+        except Exception as e:
+            logger.warning("[%s] WebDAV GET %s failed: %s", self.name, path, e)
+            return None
+        if resp.status_code != 200:
+            logger.warning("[%s] WebDAV GET %s: HTTP %s", self.name, path, resp.status_code)
+            return None
+        if len(resp.content) > MAX_INBOUND_FILE_BYTES:
+            return None
+        return resp.content
 
     def _remember(
         self, token: str, actor: Dict[str, Optional[str]], text: str, msg_id: Optional[str] = None
@@ -1122,6 +1294,167 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             logger.debug("[%s] delete %s/%s failed: %s", self.name, chat_id, message_id, e)
             return False
         return resp.status_code in (200, 202)
+
+    # -- Outbound media: upload to our own Files, then share into the room --
+
+    async def send_image(
+        self, chat_id: str, image_url: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        data = await self._fetch_url(image_url)
+        if data is None:
+            # Could not fetch it: the base posts the URL as text, still useful.
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
+        name = os.path.basename(image_url.split("?", 1)[0]) or "image.png"
+        return await self._share_bytes(chat_id, data, name, caption, reply_to)
+
+    async def send_animation(
+        self, chat_id: str, animation_url: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        return await self.send_image(chat_id, animation_url, caption, reply_to, metadata)
+
+    async def send_image_file(
+        self, chat_id: str, image_path: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
+    ) -> SendResult:
+        return await self._share_path(chat_id, image_path, caption, reply_to)
+
+    async def send_video(
+        self, chat_id: str, video_path: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
+    ) -> SendResult:
+        return await self._share_path(chat_id, video_path, caption, reply_to)
+
+    async def send_document(
+        self, chat_id: str, file_path: str, caption: Optional[str] = None,
+        file_name: Optional[str] = None, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None, **kwargs,
+    ) -> SendResult:
+        return await self._share_path(chat_id, file_path, caption, reply_to, name=file_name)
+
+    async def send_voice(
+        self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
+    ) -> SendResult:
+        """A Talk voice message (inline player), not a plain audio attachment."""
+        return await self._share_path(chat_id, audio_path, caption, reply_to, voice=True)
+
+    async def _share_path(
+        self, chat_id: str, path: str, caption: Optional[str], reply_to: Optional[str],
+        *, name: Optional[str] = None, voice: bool = False,
+    ) -> SendResult:
+        if path.startswith("file://"):
+            from urllib.request import url2pathname
+            path = url2pathname(path[7:])
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            return SendResult(success=False, error=f"cannot read {path}: {e}")
+        return await self._share_bytes(
+            chat_id, data, name or os.path.basename(path), caption, reply_to, voice=voice)
+
+    async def _share_bytes(
+        self, chat_id: str, data: bytes, filename: str, caption: Optional[str],
+        reply_to: Optional[str], *, voice: bool = False,
+    ) -> SendResult:
+        """Upload *data* to ``Talk/`` in the agent's Files and share it into the room.
+
+        Talk shows a share to the conversation (shareType 10) as a file message
+        with the caption as its text; ``talkMetaData.messageType`` makes it a
+        voice message. Federated rooms cannot receive shares, see
+        ``_federated_media``.
+        """
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+        room = self._room_meta.get(chat_id) or {}
+        federated = bool(room.get("remoteServer"))
+        if federated and self._federated_media != "link":
+            return SendResult(
+                success=False,
+                error="file sharing is not available in federated conversations "
+                      f"(set {FEDERATED_MEDIA_ENV}=link to post an expiring link)",
+            )
+        safe = re.sub(r"[^\w.\- ]", "_", filename).strip() or "file"
+        # A unique folder per upload, so the room sees the file's real name.
+        folder = f"{OUTBOUND_FOLDER}/{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        remote = f"{folder}/{safe}"
+        dav = f"/remote.php/dav/files/{quote(self._username)}"
+        try:
+            await self._http_client.request("MKCOL", f"{dav}/{OUTBOUND_FOLDER}")  # 405 = exists
+            await self._http_client.request("MKCOL", f"{dav}/{quote(folder)}")
+            put = await self._http_client.put(f"{dav}/{quote(remote)}", content=data)
+        except Exception as e:
+            return SendResult(success=False, error=f"upload failed: {e}", retryable=True)
+        if put.status_code not in (201, 204):
+            return SendResult(success=False, error=f"upload failed: HTTP {put.status_code}")
+
+        if federated:
+            return await self._post_public_link(chat_id, remote, safe, caption, reply_to)
+
+        meta: Dict[str, Any] = {}
+        if caption:
+            meta["caption"] = caption
+        if reply_to:
+            try:
+                meta["replyTo"] = int(reply_to)
+            except (TypeError, ValueError):
+                pass
+        if voice:
+            meta["messageType"] = "voice-message"
+        form = {"shareType": "10", "shareWith": chat_id, "path": f"/{remote}"}
+        if meta:
+            form["talkMetaData"] = json.dumps(meta)
+        try:
+            resp = await self._http_client.post(
+                "/ocs/v2.php/apps/files_sharing/api/v1/shares",
+                params={"format": "json"}, data=form,
+            )
+        except Exception as e:
+            return SendResult(success=False, error=f"share failed: {e}", retryable=True)
+        if resp.status_code >= 300:
+            return SendResult(success=False, error=f"share failed: HTTP {resp.status_code}: {resp.text[:200]}")
+        return SendResult(success=True)
+
+    async def _post_public_link(
+        self, chat_id: str, remote: str, name: str, caption: Optional[str], reply_to: Optional[str],
+    ) -> SendResult:
+        expire = time.strftime("%Y-%m-%d", time.gmtime(time.time() + FEDERATED_LINK_DAYS * 86400))
+        try:
+            resp = await self._http_client.post(
+                "/ocs/v2.php/apps/files_sharing/api/v1/shares",
+                params={"format": "json"},
+                data={"shareType": "3", "path": f"/{remote}", "permissions": "1", "expireDate": expire},
+            )
+            url = resp.json().get("ocs", {}).get("data", {}).get("url") if resp.status_code < 300 else None
+        except Exception as e:
+            return SendResult(success=False, error=f"link share failed: {e}", retryable=True)
+        if not url:
+            return SendResult(success=False, error=f"link share failed: HTTP {resp.status_code}")
+        text = f"{caption}\n" if caption else ""
+        text += f"📎 {name} (link expires {expire}): {url}"
+        return await self.send(chat_id, text, reply_to=reply_to)
+
+    async def _fetch_url(self, url: str) -> Optional[bytes]:
+        """Fetch an image URL (http/https/file) for re-upload; None on any failure."""
+        if url.startswith("file://") or os.path.isabs(url):
+            path = url[7:] if url.startswith("file://") else url
+            try:
+                with open(path, "rb") as fh:
+                    return fh.read(MAX_INBOUND_FILE_BYTES + 1)[:MAX_INBOUND_FILE_BYTES]
+            except OSError:
+                return None
+        if not url.startswith(("http://", "https://")):
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                resp = await client.get(url)
+        except Exception:
+            return None
+        if resp.status_code != 200 or len(resp.content) > MAX_INBOUND_FILE_BYTES:
+            return None
+        return resp.content
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         # Talk's typing signal requires the signaling backend, not the
