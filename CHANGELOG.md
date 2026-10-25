@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.4.2] - 2026-10-24
+
+### Fixed
+
+- Slash commands work in mention-mode rooms. `@jarvis /sethome` reached the
+  core as `[Room rules...] @Jarvis /sethome`, so it was never recognised as a
+  command and `/sethome` could not be run from a group room. A leading
+  self-mention is now stripped from commands, and commands skip the room-rules
+  and backlog prefixes.
+
 ## [1.4.1] - 2026-10-24
 
 ### Fixed

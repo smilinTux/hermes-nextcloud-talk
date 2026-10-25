@@ -341,6 +341,20 @@ def _resolve_mention_placeholders(text: str, parameters: Optional[Dict[str, Any]
     return re.sub(r"\{(mention-[a-zA-Z0-9_-]+)\}", _sub, text)
 
 
+def _strip_leading_self_mention(text: str, own_user_id: str, own_display_name: str) -> str:
+    """Drop a leading ``@us`` so ``@jarvis /sethome`` reaches the core as ``/sethome``.
+
+    In a mention-mode room a slash command only arrives if it @mentions us, and
+    the core treats a message as a command only when it starts with ``/``.
+    """
+    names = {n for n in (own_user_id, own_display_name) if n}
+    for name in sorted(names, key=len, reverse=True):
+        m = re.match(r'@"?' + re.escape(name) + r'"?(?![\w.-])[\s,:]*', text, re.IGNORECASE)
+        if m:
+            return text[m.end():]
+    return text
+
+
 def _is_mention(
     text: str,
     message_parameters: Optional[Dict[str, Any]],
@@ -817,6 +831,11 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             text, message.get("messageParameters"), self._username, self._display_name
         )
         text = _resolve_mention_placeholders(text, message.get("messageParameters"))
+        if mentioned:
+            bare = _strip_leading_self_mention(text, self._username, self._display_name)
+            if bare.startswith("/"):
+                text = bare
+        is_command = text.startswith("/")
 
         source = self.build_source(
             chat_id=token,
@@ -862,6 +881,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 self._remember(token, actor, text)
                 return
 
+        if is_command:
+            # Slash commands (/sethome, /new ...) go to the core verbatim: any
+            # prefix would stop it recognising the command. Backlog is kept
+            # for the next normal reply.
+            await self.handle_message(event)
+            return
         backlog = self._room_context.pop(token, [])
         if backlog:
             event.text = _with_room_context(text, backlog)

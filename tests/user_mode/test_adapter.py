@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import user.adapter as user_adapter
 from user.adapter import (
+    _strip_leading_self_mention,
     DEFAULT_AGENT_CHAIN_LIMIT,
     DEFAULT_LONG_POLL_TIMEOUT,
     DEFAULT_WORKING_REACTION_EMOJI,
@@ -774,3 +775,42 @@ def test_room_rules_opt_in_applies_to_every_room():
 def test_mention_rich_parameter_id_is_case_insensitive():
     params = {"mention-user1": {"type": "user", "id": "Hermes-Bot", "name": "Hermes"}}
     assert _is_mention("{mention-user1} hi", params, "hermes-bot", "Hermes") is True
+
+
+# -- slash commands addressed with an @mention ---------------------------
+
+
+def _mention_room(token, *, description="Room rules here"):
+    return {"token": token, "type": ROOM_TYPE_GROUP, "displayName": "ops", "description": description}
+
+
+def test_mentioned_slash_command_reaches_core_without_prefixes():
+    adapter = _make_adapter(room_modes="tok1=mention", allow_all_users=True)
+    adapter._room_meta["tok1"] = _mention_room("tok1")
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "earlier chatter")))
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+    _run(adapter._on_message("tok1", _talk_message("2", "dave", "{mention-user1} /sethome", params=params)))
+    assert [e.text for e in adapter.handled_events] == ["/sethome"]
+    assert adapter._room_context["tok1"]  # backlog kept for the next real reply
+
+
+def test_federated_capitalised_mention_slash_command_is_stripped():
+    adapter = _make_adapter(room_modes="tok1=mention", allow_all_users=True)
+    adapter._room_meta["tok1"] = _mention_room("tok1")
+    params = {"mention-federated-user1": {"type": "user", "id": "Hermes-Bot", "name": "Hermes-Bot"}}
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{mention-federated-user1}: /new", params=params)))
+    assert [e.text for e in adapter.handled_events] == ["/new"]
+
+
+def test_mentioned_normal_message_keeps_mention_and_rules():
+    adapter = _make_adapter(room_modes="tok1=mention", allow_all_users=True)
+    adapter._room_meta["tok1"] = _mention_room("tok1")
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "{mention-user1} status?", params=params)))
+    text = adapter.handled_events[0].text
+    assert "Room rules here" in text and text.endswith("@Hermes status?")
+
+
+def test_strip_leading_self_mention_ignores_longer_names():
+    assert _strip_leading_self_mention("@hermes-botx /x", "hermes-bot", "") == "@hermes-botx /x"
+    assert _strip_leading_self_mention('@"Hermes Bot" /x', "hb", "Hermes Bot") == "/x"
