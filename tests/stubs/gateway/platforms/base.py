@@ -132,6 +132,14 @@ class BasePlatformAdapter:
             thread_id=str(thread_id) if thread_id else None,
         )
 
+    # Mirrors the real base: optional surfaces return failure so callers fall
+    # back; the runner only shows tool progress when edit_message is overridden.
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> "SendResult":
+        return SendResult(success=False, error="Not supported")
+
+    async def delete_message(self, chat_id, message_id) -> bool:
+        return False
+
     async def handle_message(self, event: MessageEvent) -> None:
         """Test double: record the event instead of running the real agent loop."""
         self.handled_events.append(event)
