@@ -1055,3 +1055,86 @@ def test_files_in_a_listening_room_are_not_downloaded():
     _run(adapter._on_message("tok1", _talk_message("1", "dave", "{file}", display_name="Dave", params={"file": _FILE})))
     assert adapter.handled_events == []
     assert adapter._room_context["tok1"] == ["Dave: [file: spike.txt (text/plain)]"]
+
+
+# -- Outbound media ---------------------------------------------------------
+
+from urllib.parse import parse_qs  # noqa: E402
+
+
+def _recording_adapter(responses=None, federated=False, **extra):
+    calls = []
+
+    def handler(request):
+        body = request.content
+        calls.append((request.method, request.url.path, body))
+        if request.url.path.endswith("/shares"):
+            form = parse_qs(body.decode())
+            if form.get("shareType") == ["3"]:
+                return httpx.Response(200, json={"ocs": {"data": {"url": "https://skhub.example/s/abc"}}})
+            return httpx.Response(200, json={"ocs": {"data": {"id": 90}}})
+        if request.method == "MKCOL":
+            return httpx.Response(405)
+        if request.method == "PUT":
+            return httpx.Response(201)
+        return httpx.Response(201, json={"ocs": {"data": {"id": 777}}})
+
+    adapter = _make_adapter(**extra)
+    room = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "ops"}
+    if federated:
+        room["remoteServer"] = "https://other.example"
+    adapter._room_meta["tok1"] = room
+    adapter._http_client = httpx.AsyncClient(base_url="https://skhub.example", transport=httpx.MockTransport(handler))
+    return adapter, calls
+
+
+def test_document_is_uploaded_then_shared_into_the_room(tmp_path):
+    f = tmp_path / "report.pdf"
+    f.write_bytes(b"%PDF-1.7")
+    adapter, calls = _recording_adapter()
+    result = _run(adapter.send_document("tok1", str(f), caption="Q3 numbers", reply_to="42"))
+    assert result.success
+    methods = [c[0] for c in calls]
+    assert methods == ["MKCOL", "MKCOL", "PUT", "POST"]
+    assert calls[2][1].startswith("/remote.php/dav/files/hermes-bot/Talk/") and calls[2][1].endswith("/report.pdf")
+    assert calls[2][2] == b"%PDF-1.7"
+    form = parse_qs(calls[3][2].decode())
+    assert form["shareType"] == ["10"] and form["shareWith"] == ["tok1"]
+    assert json.loads(form["talkMetaData"][0]) == {"caption": "Q3 numbers", "replyTo": 42}
+
+
+def test_voice_is_shared_as_a_talk_voice_message(tmp_path):
+    f = tmp_path / "reply.ogg"
+    f.write_bytes(b"OggS")
+    adapter, calls = _recording_adapter()
+    assert _run(adapter.send_voice("tok1", str(f))).success
+    form = parse_qs(calls[3][2].decode())
+    assert json.loads(form["talkMetaData"][0]) == {"messageType": "voice-message"}
+
+
+def test_federated_room_refuses_by_default_without_uploading(tmp_path):
+    f = tmp_path / "a.png"
+    f.write_bytes(b"\x89PNG")
+    adapter, calls = _recording_adapter(federated=True)
+    result = _run(adapter.send_image_file("tok1", str(f)))
+    assert result.success is False and "federated" in result.error
+    assert calls == []
+
+
+def test_federated_room_with_link_mode_posts_an_expiring_link(tmp_path):
+    f = tmp_path / "a.png"
+    f.write_bytes(b"\x89PNG")
+    adapter, calls = _recording_adapter(federated=True, federated_media="link")
+    assert _run(adapter.send_image_file("tok1", str(f), caption="chart")).success
+    share_form = parse_qs(calls[3][2].decode())
+    assert share_form["shareType"] == ["3"] and share_form["permissions"] == ["1"] and "expireDate" in share_form
+    chat = json.loads(calls[4][2])
+    assert calls[4][1] == "/ocs/v2.php/apps/spreed/api/v1/chat/tok1"
+    assert chat["message"].startswith("chart\n📎 a.png (link expires ") and chat["message"].endswith("https://skhub.example/s/abc")
+
+
+def test_unfetchable_image_url_falls_back_to_posting_the_url():
+    adapter, calls = _recording_adapter()
+    result = _run(adapter.send_image("tok1", "ftp://nope/x.png", caption="pic"))
+    assert result.success
+    assert [c[0] for c in calls] == ["POST"] and json.loads(calls[0][2])["message"] == "pic\nftp://nope/x.png"

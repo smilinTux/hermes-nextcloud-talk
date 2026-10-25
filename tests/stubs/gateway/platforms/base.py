@@ -145,6 +145,11 @@ class BasePlatformAdapter:
     async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> "SendResult":
         return SendResult(success=False, error="Not supported")
 
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
+        # Real base: post the URL (with caption) as text.
+        text = f"{caption}\n{image_url}" if caption else image_url
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
     async def delete_message(self, chat_id, message_id) -> bool:
         return False
 

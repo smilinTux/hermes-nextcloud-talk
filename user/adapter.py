@@ -30,6 +30,8 @@ Environment variables (env wins over config.yaml ``extra``):
     NEXTCLOUD_TALK_DISPLAY_NAME             Display name for plain-text mentions (default: Hermes)
     NEXTCLOUD_TALK_ALLOWED_INVITERS        Federation inviters to auto-accept from
     NEXTCLOUD_TALK_ROOM_MODES              "token1=mention,token2=watch,token3=free"
+    NEXTCLOUD_TALK_FEDERATED_MEDIA         "link" posts an expiring public link for files in federated
+                                             rooms (Talk cannot share into them); default "off"
     NEXTCLOUD_TALK_ALLOWED_USERS           Allowlist (gateway auth integration)
     NEXTCLOUD_TALK_ALLOW_ALL_USERS         Allow any user -- dev only
     NEXTCLOUD_TALK_HOME_CHANNEL            Default room token for cron delivery
@@ -361,6 +363,8 @@ _TEXT_EXTENSIONS = frozenset({
 })
 # Where outbound files are uploaded in the agent's own Files before sharing.
 OUTBOUND_FOLDER = "Talk"
+FEDERATED_MEDIA_ENV = "NEXTCLOUD_TALK_FEDERATED_MEDIA"
+FEDERATED_LINK_DAYS = 7
 
 
 def _file_parameters(parameters: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -661,6 +665,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         # room token -> {message id: its line in _room_context}, so an edit or
         # deletion of a still-unanswered message updates the backlog in place
         self._room_context_ids: Dict[str, Dict[str, str]] = {}
+        # Talk cannot share a file into a federated conversation. "link" uploads
+        # to the agent's own Files and posts an expiring public link instead;
+        # off by default because a public link is readable by anyone who has it.
+        self._federated_media: str = str(
+            extra.get("federated_media") or os.getenv(FEDERATED_MEDIA_ENV, "off")
+        ).strip().lower()
         # room token -> agent messages seen in a row since the last human message
         self._agent_chain: Dict[str, int] = {}
         self._discovery_interval: float = float(
@@ -1284,6 +1294,167 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             logger.debug("[%s] delete %s/%s failed: %s", self.name, chat_id, message_id, e)
             return False
         return resp.status_code in (200, 202)
+
+    # -- Outbound media: upload to our own Files, then share into the room --
+
+    async def send_image(
+        self, chat_id: str, image_url: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        data = await self._fetch_url(image_url)
+        if data is None:
+            # Could not fetch it: the base posts the URL as text, still useful.
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
+        name = os.path.basename(image_url.split("?", 1)[0]) or "image.png"
+        return await self._share_bytes(chat_id, data, name, caption, reply_to)
+
+    async def send_animation(
+        self, chat_id: str, animation_url: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        return await self.send_image(chat_id, animation_url, caption, reply_to, metadata)
+
+    async def send_image_file(
+        self, chat_id: str, image_path: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
+    ) -> SendResult:
+        return await self._share_path(chat_id, image_path, caption, reply_to)
+
+    async def send_video(
+        self, chat_id: str, video_path: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
+    ) -> SendResult:
+        return await self._share_path(chat_id, video_path, caption, reply_to)
+
+    async def send_document(
+        self, chat_id: str, file_path: str, caption: Optional[str] = None,
+        file_name: Optional[str] = None, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None, **kwargs,
+    ) -> SendResult:
+        return await self._share_path(chat_id, file_path, caption, reply_to, name=file_name)
+
+    async def send_voice(
+        self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
+    ) -> SendResult:
+        """A Talk voice message (inline player), not a plain audio attachment."""
+        return await self._share_path(chat_id, audio_path, caption, reply_to, voice=True)
+
+    async def _share_path(
+        self, chat_id: str, path: str, caption: Optional[str], reply_to: Optional[str],
+        *, name: Optional[str] = None, voice: bool = False,
+    ) -> SendResult:
+        if path.startswith("file://"):
+            from urllib.request import url2pathname
+            path = url2pathname(path[7:])
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            return SendResult(success=False, error=f"cannot read {path}: {e}")
+        return await self._share_bytes(
+            chat_id, data, name or os.path.basename(path), caption, reply_to, voice=voice)
+
+    async def _share_bytes(
+        self, chat_id: str, data: bytes, filename: str, caption: Optional[str],
+        reply_to: Optional[str], *, voice: bool = False,
+    ) -> SendResult:
+        """Upload *data* to ``Talk/`` in the agent's Files and share it into the room.
+
+        Talk shows a share to the conversation (shareType 10) as a file message
+        with the caption as its text; ``talkMetaData.messageType`` makes it a
+        voice message. Federated rooms cannot receive shares, see
+        ``_federated_media``.
+        """
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+        room = self._room_meta.get(chat_id) or {}
+        federated = bool(room.get("remoteServer"))
+        if federated and self._federated_media != "link":
+            return SendResult(
+                success=False,
+                error="file sharing is not available in federated conversations "
+                      f"(set {FEDERATED_MEDIA_ENV}=link to post an expiring link)",
+            )
+        safe = re.sub(r"[^\w.\- ]", "_", filename).strip() or "file"
+        # A unique folder per upload, so the room sees the file's real name.
+        folder = f"{OUTBOUND_FOLDER}/{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        remote = f"{folder}/{safe}"
+        dav = f"/remote.php/dav/files/{quote(self._username)}"
+        try:
+            await self._http_client.request("MKCOL", f"{dav}/{OUTBOUND_FOLDER}")  # 405 = exists
+            await self._http_client.request("MKCOL", f"{dav}/{quote(folder)}")
+            put = await self._http_client.put(f"{dav}/{quote(remote)}", content=data)
+        except Exception as e:
+            return SendResult(success=False, error=f"upload failed: {e}", retryable=True)
+        if put.status_code not in (201, 204):
+            return SendResult(success=False, error=f"upload failed: HTTP {put.status_code}")
+
+        if federated:
+            return await self._post_public_link(chat_id, remote, safe, caption, reply_to)
+
+        meta: Dict[str, Any] = {}
+        if caption:
+            meta["caption"] = caption
+        if reply_to:
+            try:
+                meta["replyTo"] = int(reply_to)
+            except (TypeError, ValueError):
+                pass
+        if voice:
+            meta["messageType"] = "voice-message"
+        form = {"shareType": "10", "shareWith": chat_id, "path": f"/{remote}"}
+        if meta:
+            form["talkMetaData"] = json.dumps(meta)
+        try:
+            resp = await self._http_client.post(
+                "/ocs/v2.php/apps/files_sharing/api/v1/shares",
+                params={"format": "json"}, data=form,
+            )
+        except Exception as e:
+            return SendResult(success=False, error=f"share failed: {e}", retryable=True)
+        if resp.status_code >= 300:
+            return SendResult(success=False, error=f"share failed: HTTP {resp.status_code}: {resp.text[:200]}")
+        return SendResult(success=True)
+
+    async def _post_public_link(
+        self, chat_id: str, remote: str, name: str, caption: Optional[str], reply_to: Optional[str],
+    ) -> SendResult:
+        expire = time.strftime("%Y-%m-%d", time.gmtime(time.time() + FEDERATED_LINK_DAYS * 86400))
+        try:
+            resp = await self._http_client.post(
+                "/ocs/v2.php/apps/files_sharing/api/v1/shares",
+                params={"format": "json"},
+                data={"shareType": "3", "path": f"/{remote}", "permissions": "1", "expireDate": expire},
+            )
+            url = resp.json().get("ocs", {}).get("data", {}).get("url") if resp.status_code < 300 else None
+        except Exception as e:
+            return SendResult(success=False, error=f"link share failed: {e}", retryable=True)
+        if not url:
+            return SendResult(success=False, error=f"link share failed: HTTP {resp.status_code}")
+        text = f"{caption}\n" if caption else ""
+        text += f"📎 {name} (link expires {expire}): {url}"
+        return await self.send(chat_id, text, reply_to=reply_to)
+
+    async def _fetch_url(self, url: str) -> Optional[bytes]:
+        """Fetch an image URL (http/https/file) for re-upload; None on any failure."""
+        if url.startswith("file://") or os.path.isabs(url):
+            path = url[7:] if url.startswith("file://") else url
+            try:
+                with open(path, "rb") as fh:
+                    return fh.read(MAX_INBOUND_FILE_BYTES + 1)[:MAX_INBOUND_FILE_BYTES]
+            except OSError:
+                return None
+        if not url.startswith(("http://", "https://")):
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                resp = await client.get(url)
+        except Exception:
+            return None
+        if resp.status_code != 200 or len(resp.content) > MAX_INBOUND_FILE_BYTES:
+            return None
+        return resp.content
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         # Talk's typing signal requires the signaling backend, not the
