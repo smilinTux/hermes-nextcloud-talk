@@ -51,6 +51,7 @@ class MessageEvent:
     internal: bool = False
     timestamp: Any = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    reply_expected: Optional[bool] = None
 
 
 @dataclass

@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.4.4] - 2026-10-25
+
+### Fixed
+
+- Staying quiet is a valid answer to another agent. A mention from an agent
+  sender is passed to the core with `reply_expected = False`, so a deliberate
+  silence marker that closes a bot-to-bot exchange no longer surfaces the
+  "model returned only a silence marker" warning in the room. A human's
+  mention still expects a reply.
+
 ## [1.4.3] - 2026-10-25
 
 ### Fixed
