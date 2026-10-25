@@ -355,6 +355,10 @@ def _strip_leading_self_mention(text: str, own_user_id: str, own_display_name: s
     return text
 
 
+# Fenced blocks first (they may contain backticks), then inline code spans.
+_RE_CODE = re.compile(r"```[\s\S]*?```|`[^`\n]*`")
+
+
 def _is_mention(
     text: str,
     message_parameters: Optional[Dict[str, Any]],
@@ -373,17 +377,28 @@ def _is_mention(
        ``@"Display Name"`` syntax, case-insensitive, for clients that
        don't send rich parameters.
     """
+    text = text or ""
+    # A mention quoted inside code is an example, not an address. Lumina told
+    # Dave to "use `@Jarvis /approve`" and Jarvis took it as a summons and
+    # answered (Operators AI, 2026-10-25). Talk's server still turns that
+    # quoted @jarvis into a rich {mention-userN} placeholder, so both signals
+    # below look only at text outside code spans and fenced blocks.
+    visible = _RE_CODE.sub(" ", text)
+
     message_parameters = message_parameters or {}
-    for param in message_parameters.values():
+    for key, param in message_parameters.items():
         if not isinstance(param, dict):
             continue
         # Talk ids are case-insensitive: a federated sender's client can resolve
         # "@Jarvis" to id "Jarvis" for the local account "jarvis".
         if (param.get("type") in ("user", "call")
                 and str(param.get("id") or "").casefold() == (own_user_id or "").casefold()):
+            placeholder = "{" + str(key) + "}"
+            if placeholder in text and placeholder not in visible:
+                continue  # only ever quoted inside code
             return True
 
-    text = text or ""
+    text = visible
     own_user_id = (own_user_id or "").strip()
     own_display_name = (own_display_name or "").strip()
     if own_user_id and re.search(
