@@ -895,6 +895,13 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 )
                 self._remember(token, actor, text)
                 return
+            # Another agent addressing us does not oblige an answer: closing a
+            # bot-to-bot exchange by staying quiet is correct (room rule:
+            # stop after N rounds). Without this the core treated Lumina's
+            # deliberate silence marker as a failure and posted its
+            # "model returned only a silence marker" warning into the room
+            # (Operators AI, 2026-10-25). A human's mention still expects a reply.
+            event.reply_expected = False
 
         if is_command:
             # Slash commands (/sethome, /new ...) go to the core verbatim: any

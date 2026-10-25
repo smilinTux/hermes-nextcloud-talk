@@ -845,3 +845,30 @@ def test_mention_inside_fenced_block_is_ignored():
 def test_rich_mention_without_placeholder_in_text_still_counts():
     params = {"mention-user1": {"type": "user", "id": "jarvis"}}
     assert _is_mention("ping", params, "jarvis", "Jarvis") is True
+
+
+# -- Silence is a valid answer to another agent ----------------------------
+
+
+def test_agent_mention_does_not_oblige_a_reply():
+    # Closing a bot-to-bot exchange by staying quiet must not surface the core's
+    # "model returned only a silence marker" warning in the room.
+    adapter = _make_adapter(agent_users="ops-bot", room_modes="tok1=free")
+    adapter._room_meta["tok1"] = _free_group_room("tok1")
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+
+    _run(adapter._on_message("tok1", _talk_message("1", "ops-bot", "{mention-user1} round 2 done", params=params)))
+
+    assert len(adapter.handled_events) == 1
+    assert adapter.handled_events[0].reply_expected is False
+
+
+def test_human_mention_still_expects_a_reply():
+    adapter = _make_adapter(agent_users="ops-bot", room_modes="tok1=free")
+    adapter._room_meta["tok1"] = _free_group_room("tok1")
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+
+    _run(adapter._on_message("tok1", _talk_message("1", "chefboyrdave2.1", "{mention-user1} ping", params=params)))
+
+    assert len(adapter.handled_events) == 1
+    assert adapter.handled_events[0].reply_expected is None
