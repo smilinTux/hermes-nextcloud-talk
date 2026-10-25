@@ -1138,3 +1138,77 @@ def test_unfetchable_image_url_falls_back_to_posting_the_url():
     result = _run(adapter.send_image("tok1", "ftp://nope/x.png", caption="pic"))
     assert result.success
     assert [c[0] for c in calls] == ["POST"] and json.loads(calls[0][2])["message"] == "pic\nftp://nope/x.png"
+
+
+# -- Team role from Nextcloud profiles ----------------------------------------
+
+from user.adapter import _build_role_prompt  # noqa: E402
+
+
+def test_role_prompt_from_own_profile_and_teammates():
+    own = {"displayname": "Lumina", "role": "Memory, GTD, calendar", "headline": "Queen of SKWorld",
+           "organisation": "smilinTux", "biography": "Owns DrChiro work.", "pronouns": ""}
+    mates = {"jarvis": {"displayname": "Jarvis", "role": "Infra and coord boards", "headline": ""}}
+    prompt = _build_role_prompt(own, mates)
+    assert prompt.startswith("[Your role on this team, from your Nextcloud profile.")
+    assert "Role: Memory, GTD, calendar" in prompt and "About: Owns DrChiro work." in prompt
+    assert "Pronouns" not in prompt  # empty fields are left out
+    assert "- Jarvis (jarvis): Role: Infra and coord boards" in prompt
+
+
+def test_empty_profiles_add_nothing():
+    assert _build_role_prompt({"displayname": "X", "role": "", "biography": " "}, {}) is None
+
+
+def _profile_adapter(profiles, **extra):
+    def handler(request):
+        uid = request.url.path.rsplit("/", 1)[-1]
+        if uid in profiles:
+            return httpx.Response(200, json={"ocs": {"data": profiles[uid]}})
+        return httpx.Response(404, json={"ocs": {"data": []}})
+
+    adapter = _make_adapter(room_modes="tok1=free", allow_all_users=True, **extra)
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "ops"}
+    adapter._http_client = httpx.AsyncClient(base_url="https://skhub.example", transport=httpx.MockTransport(handler))
+    return adapter
+
+
+def test_role_rides_on_channel_prompt_not_in_the_text():
+    adapter = _profile_adapter({"hermes-bot": {"displayname": "Hermes", "role": "Release manager"}})
+    _run(adapter._refresh_profile_role(force=True))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "what ships today?")))
+    event = adapter.handled_events[0]
+    assert event.text == "what ships today?"
+    assert "Role: Release manager" in event.channel_prompt
+
+
+def test_local_teammates_are_read_and_federated_ones_skipped():
+    seen = []
+    profiles = {"hermes-bot": {"role": "Lead"}, "ops-bot": {"displayname": "Ops", "role": "On-call"}}
+
+    def handler(request):
+        uid = request.url.path.rsplit("/", 1)[-1]
+        seen.append(uid)
+        return httpx.Response(200, json={"ocs": {"data": profiles.get(uid, {})}})
+
+    adapter = _make_adapter(agent_users="ops-bot,lumina@other.example")
+    adapter._http_client = httpx.AsyncClient(base_url="https://skhub.example", transport=httpx.MockTransport(handler))
+    _run(adapter._refresh_profile_role(force=True))
+    assert seen == ["hermes-bot", "ops-bot"]
+    assert "- Ops (ops-bot): Role: On-call" in adapter._role_prompt
+
+
+def test_profile_role_can_be_turned_off():
+    adapter = _profile_adapter({"hermes-bot": {"role": "Lead"}}, profile_role="off")
+    _run(adapter._refresh_profile_role(force=True))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "hi")))
+    assert adapter.handled_events[0].channel_prompt is None
+
+
+def test_failed_profile_read_keeps_last_good_prompt():
+    adapter = _profile_adapter({"hermes-bot": {"role": "Lead"}})
+    _run(adapter._refresh_profile_role(force=True))
+    adapter._http_client = httpx.AsyncClient(
+        base_url="https://skhub.example", transport=httpx.MockTransport(lambda r: httpx.Response(503)))
+    _run(adapter._refresh_profile_role(force=True))
+    assert "Role: Lead" in adapter._role_prompt
