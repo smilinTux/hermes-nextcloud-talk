@@ -4,6 +4,21 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.5.0] - 2026-10-25
+
+### Added
+
+- User mode edits and deletes its own messages (`edit_message`, `delete_message`
+  over Talk's `edit-messages` / `delete-messages` API). This is what turns on
+  Hermes' tool-progress bubble and edit-based streaming in Talk: the runner
+  silently drops every progress update on a platform whose adapter keeps the
+  base no-op. Over-long content and server refusals (Talk's edit window) return
+  failure, so the caller sends a fresh message instead.
+- The active-listening backlog follows edits and deletions: when another
+  participant (often an agent streaming through edits) edits or deletes a
+  message we are holding as context, the backlog line is rewritten or dropped
+  instead of handing over the first draft.
+
 ## [1.4.4] - 2026-10-25
 
 ### Fixed

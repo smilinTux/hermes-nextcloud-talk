@@ -872,3 +872,102 @@ def test_human_mention_still_expects_a_reply():
 
     assert len(adapter.handled_events) == 1
     assert adapter.handled_events[0].reply_expected is None
+
+
+# -- Editing / deleting our own messages (turns on tool progress + streaming) --
+
+import json  # noqa: E402
+
+import httpx  # noqa: E402
+
+
+def _adapter_with_transport(handler):
+    adapter = _make_adapter()
+    adapter._http_client = httpx.AsyncClient(
+        base_url="https://skhub.example", transport=httpx.MockTransport(handler))
+    return adapter
+
+
+def test_edit_message_puts_new_text_to_the_message_url():
+    seen = {}
+
+    def handler(request):
+        seen["method"], seen["path"] = request.method, request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ocs": {"data": {"systemMessage": "message_edited"}}})
+
+    adapter = _adapter_with_transport(handler)
+    result = _run(adapter.edit_message("tok1", "4057", "step 2 of 3"))
+    assert result.success and result.message_id == "4057"
+    assert seen == {"method": "PUT", "path": "/ocs/v2.php/apps/spreed/api/v1/chat/tok1/4057",
+                    "body": {"message": "step 2 of 3"}}
+
+
+def test_edit_refused_by_server_tells_caller_to_send_anew():
+    adapter = _adapter_with_transport(lambda r: httpx.Response(403, json={"ocs": {"meta": {"message": "edit window"}}}))
+    assert _run(adapter.edit_message("tok1", "1", "x")).success is False
+
+
+def test_edit_too_long_is_not_attempted():
+    calls = []
+    adapter = _adapter_with_transport(lambda r: calls.append(r) or httpx.Response(200, json={}))
+    assert _run(adapter.edit_message("tok1", "1", "x" * (MAX_MESSAGE_LENGTH + 1))).success is False
+    assert calls == []
+
+
+def test_delete_message():
+    seen = {}
+
+    def handler(request):
+        seen["method"], seen["path"] = request.method, request.url.path
+        return httpx.Response(200, json={"ocs": {"data": {}}})
+
+    adapter = _adapter_with_transport(handler)
+    assert _run(adapter.delete_message("tok1", "9")) is True
+    assert seen == {"method": "DELETE", "path": "/ocs/v2.php/apps/spreed/api/v1/chat/tok1/9"}
+
+
+def test_edit_message_overrides_the_base_no_op():
+    # The runner only shows tool progress when the adapter overrides edit_message.
+    from gateway.platforms.base import BasePlatformAdapter
+    assert NextcloudTalkUserAdapter.edit_message is not BasePlatformAdapter.edit_message
+
+
+# -- Backlog follows edits and deletions of unanswered messages --------------
+
+
+def _plain_mention_room(token):
+    return {"token": token, "type": ROOM_TYPE_GROUP, "displayName": "ops"}
+
+
+def _system(msg_id, kind, parent):
+    return {"id": msg_id, "actorId": parent["actorId"], "actorType": "users", "message": "",
+            "messageType": "system", "systemMessage": kind, "messageParameters": {},
+            "parent": parent, "timestamp": 1700000000}
+
+
+def test_backlog_line_is_rewritten_when_the_message_is_edited():
+    adapter = _make_adapter(room_modes="tok1=mention", allow_all_users=True)
+    adapter._room_meta["tok1"] = _plain_mention_room("tok1")
+    _run(adapter._on_message("tok1", _talk_message("10", "chefboyrdave2.1", "draft", display_name="Chef")))
+    edited = _talk_message("10", "chefboyrdave2.1", "final answer", display_name="Chef")
+    _run(adapter._on_message("tok1", _system("11", "message_edited", edited)))
+    assert adapter._room_context["tok1"] == ["Chef: final answer"]
+
+
+def test_backlog_line_is_dropped_when_the_message_is_deleted():
+    adapter = _make_adapter(room_modes="tok1=mention", allow_all_users=True)
+    adapter._room_meta["tok1"] = _plain_mention_room("tok1")
+    _run(adapter._on_message("tok1", _talk_message("10", "chefboyrdave2.1", "oops", display_name="Chef")))
+    _run(adapter._on_message("tok1", _talk_message("12", "chefboyrdave2.1", "keep me", display_name="Chef")))
+    gone = _talk_message("10", "chefboyrdave2.1", "Message deleted by you", display_name="Chef")
+    _run(adapter._on_message("tok1", _system("13", "message_deleted", gone)))
+    assert adapter._room_context["tok1"] == ["Chef: keep me"]
+
+
+def test_edit_of_an_unknown_message_is_ignored():
+    adapter = _make_adapter(room_modes="tok1=mention", allow_all_users=True)
+    adapter._room_meta["tok1"] = _plain_mention_room("tok1")
+    ghost = _talk_message("99", "chefboyrdave2.1", "never seen")
+    _run(adapter._on_message("tok1", _system("100", "message_edited", ghost)))
+    assert adapter._room_context.get("tok1") in (None, [])

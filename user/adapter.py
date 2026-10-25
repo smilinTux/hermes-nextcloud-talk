@@ -584,6 +584,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         )
         # room token -> unanswered "name: text" lines since the agent last replied
         self._room_context: Dict[str, List[str]] = {}
+        # room token -> {message id: its line in _room_context}, so an edit or
+        # deletion of a still-unanswered message updates the backlog in place
+        self._room_context_ids: Dict[str, Dict[str, str]] = {}
         # room token -> agent messages seen in a row since the last human message
         self._agent_chain: Dict[str, int] = {}
         self._discovery_interval: float = float(
@@ -822,6 +825,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         msg_id = str(message.get("id", ""))
         if not msg_id or self._is_duplicate(msg_id):
             return
+        if message.get("systemMessage") in ("message_edited", "message_deleted"):
+            # Another participant (often an agent streaming through edits)
+            # changed a message we may be holding as context: keep the backlog
+            # current instead of handing over its first draft.
+            self._apply_backlog_edit(token, message)
+            return
         if message.get("messageType") not in (None, "comment", "voice-message"):
             # Skip system messages (join/leave/call events etc).
             return
@@ -880,12 +889,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             self._watch_buffers.setdefault(token, []).append(event)
             return
         if mode == ROOM_MODE_MENTION and not mentioned:
-            self._remember(token, actor, text)
+            self._remember(token, actor, text, msg_id)
             return
         if from_agent and chat_type != "dm":
             if not mentioned:
                 # free means free for humans; another agent must still address us
-                self._remember(token, actor, text)
+                self._remember(token, actor, text, msg_id)
                 return
             if self._agent_chain[token] > self._agent_chain_limit:
                 logger.info(
@@ -893,7 +902,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                     "between, ignoring %s until a human speaks",
                     self.name, token, self._agent_chain[token], actor.get("id"),
                 )
-                self._remember(token, actor, text)
+                self._remember(token, actor, text, msg_id)
                 return
             # Another agent addressing us does not oblige an answer: closing a
             # bot-to-bot exchange by staying quiet is correct (room rule:
@@ -910,6 +919,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             await self.handle_message(event)
             return
         backlog = self._room_context.pop(token, [])
+        self._room_context_ids.pop(token, None)
         if backlog:
             event.text = _with_room_context(text, backlog)
         if chat_type != "dm" and (self._room_rules_all or token in self._room_modes):
@@ -918,7 +928,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             event.text = _with_room_rules(event.text, room.get("description"))
         await self.handle_message(event)
 
-    def _remember(self, token: str, actor: Dict[str, Optional[str]], text: str) -> None:
+    def _remember(
+        self, token: str, actor: Dict[str, Optional[str]], text: str, msg_id: Optional[str] = None
+    ) -> None:
         """Keep an unanswered message as context for the next reply in this room."""
         if self._context_messages <= 0:
             return
@@ -928,8 +940,39 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return
         name = actor.get("display_name") or actor.get("id") or "someone"
         backlog = self._room_context.setdefault(token, [])
-        backlog.append(f"{name}: {text}")
+        line = f"{name}: {text}"
+        backlog.append(line)
         self._room_context[token] = _trim_backlog(backlog, self._context_messages)
+        if msg_id:
+            ids = self._room_context_ids.setdefault(token, {})
+            ids[msg_id] = line
+            if len(ids) > 4 * max(self._context_messages, 1):
+                kept = set(self._room_context[token])
+                self._room_context_ids[token] = {k: v for k, v in ids.items() if v in kept}
+
+    def _apply_backlog_edit(self, token: str, system_message: Dict[str, Any]) -> None:
+        """Rewrite or drop the backlog line of an edited/deleted unanswered message."""
+        parent = system_message.get("parent") or {}
+        parent_id = str(parent.get("id", ""))
+        ids = self._room_context_ids.get(token) or {}
+        old_line = ids.get(parent_id)
+        backlog = self._room_context.get(token) or []
+        if not old_line or old_line not in backlog:
+            return
+        index = backlog.index(old_line)
+        if system_message.get("systemMessage") == "message_deleted":
+            del backlog[index]
+            ids.pop(parent_id, None)
+            return
+        text = _resolve_mention_placeholders(
+            (parent.get("message") or "").strip(), parent.get("messageParameters")
+        )
+        if not text:
+            return
+        name = old_line.split(": ", 1)[0]
+        new_line = f"{name}: {text}"
+        backlog[index] = new_line
+        ids[parent_id] = new_line
 
     @staticmethod
     def _parse_timestamp(unix_ts: Any) -> datetime:
@@ -1037,6 +1080,48 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 pass
 
         return SendResult(success=True, message_id=last_id)
+
+    async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
+    ) -> SendResult:
+        """Edit one of our own messages in place (Talk ``edit-messages``, Talk 18+).
+
+        Implementing this is what turns on Hermes' tool-progress bubble and
+        edit-based streaming for Talk: the runner drops every progress update
+        on a platform whose adapter keeps the base no-op. Talk only lets you
+        edit your own messages, for a limited time, and an edit cannot be
+        split, so over-long content and refusals return success=False and the
+        caller sends a fresh message instead.
+        """
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+        if len(content) > MAX_MESSAGE_LENGTH:
+            return SendResult(success=False, error="Too long to edit in place")
+        try:
+            resp = await self._http_client.put(
+                f"/ocs/v2.php/apps/spreed/api/v1/chat/{chat_id}/{message_id}",
+                params={"format": "json"},
+                json={"message": content},
+            )
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+        if resp.status_code >= 300:
+            return SendResult(success=False, error=f"HTTP {resp.status_code}: {resp.text[:200]}")
+        return SendResult(success=True, message_id=str(message_id))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete one of our own messages (Talk ``delete-messages``; time-limited)."""
+        if not self._http_client:
+            return False
+        try:
+            resp = await self._http_client.delete(
+                f"/ocs/v2.php/apps/spreed/api/v1/chat/{chat_id}/{message_id}",
+                params={"format": "json"},
+            )
+        except Exception as e:
+            logger.debug("[%s] delete %s/%s failed: %s", self.name, chat_id, message_id, e)
+            return False
+        return resp.status_code in (200, 202)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         # Talk's typing signal requires the signaling backend, not the
