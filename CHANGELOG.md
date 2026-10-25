@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.4.3] - 2026-10-25
+
+### Fixed
+
+- A mention quoted inside code no longer summons the agent. Lumina told Dave
+  to "use `@Jarvis /approve`", and Jarvis treated the example as an address and
+  replied. Plain-text and rich mentions now count only outside inline code and
+  fenced blocks (Talk's server still makes a `{mention-userN}` placeholder for
+  a quoted `@jarvis`, so its position is checked too).
+
 ## [1.4.2] - 2026-10-24
 
 ### Fixed

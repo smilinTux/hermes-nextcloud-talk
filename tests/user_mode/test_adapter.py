@@ -814,3 +814,34 @@ def test_mentioned_normal_message_keeps_mention_and_rules():
 def test_strip_leading_self_mention_ignores_longer_names():
     assert _strip_leading_self_mention("@hermes-botx /x", "hermes-bot", "") == "@hermes-botx /x"
     assert _strip_leading_self_mention('@"Hermes Bot" /x', "hb", "Hermes Bot") == "/x"
+
+
+# -- Mentions quoted inside code are examples, not addresses --------------
+
+
+def test_plain_mention_inside_inline_code_is_ignored():
+    text = "Approvals: use `@jarvis /approve` with him."
+    assert _is_mention(text, None, "jarvis", "Jarvis") is False
+
+
+def test_rich_mention_whose_placeholder_is_only_in_code_is_ignored():
+    # Talk's server makes {mention-user1} even inside backticks.
+    params = {"mention-user1": {"type": "user", "id": "jarvis", "name": "Jarvis"}}
+    text = "Same for `{mention-user1} /approve` with him."
+    assert _is_mention(text, params, "jarvis", "Jarvis") is False
+
+
+def test_rich_mention_outside_code_still_counts_even_if_also_quoted():
+    params = {"mention-user1": {"type": "user", "id": "jarvis", "name": "Jarvis"}}
+    text = "{mention-user1} please run `{mention-user1} /approve` when ready"
+    assert _is_mention(text, params, "jarvis", "Jarvis") is True
+
+
+def test_mention_inside_fenced_block_is_ignored():
+    text = "Example:\n```\n@jarvis /approve\n```\nthat is all"
+    assert _is_mention(text, None, "jarvis", "Jarvis") is False
+
+
+def test_rich_mention_without_placeholder_in_text_still_counts():
+    params = {"mention-user1": {"type": "user", "id": "jarvis"}}
+    assert _is_mention("ping", params, "jarvis", "Jarvis") is True
