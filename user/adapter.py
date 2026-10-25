@@ -32,6 +32,8 @@ Environment variables (env wins over config.yaml ``extra``):
     NEXTCLOUD_TALK_ROOM_MODES              "token1=mention,token2=watch,token3=free"
     NEXTCLOUD_TALK_FEDERATED_MEDIA         "link" posts an expiring public link for files in federated
                                              rooms (Talk cannot share into them); default "off"
+    NEXTCLOUD_TALK_PROFILE_ROLE            "off" stops reading the agent's role from its Nextcloud
+                                             profile (role, headline, organisation, about); default on
     NEXTCLOUD_TALK_ALLOWED_USERS           Allowlist (gateway auth integration)
     NEXTCLOUD_TALK_ALLOW_ALL_USERS         Allow any user -- dev only
     NEXTCLOUD_TALK_HOME_CHANNEL            Default room token for cron delivery
@@ -366,6 +368,19 @@ OUTBOUND_FOLDER = "Talk"
 FEDERATED_MEDIA_ENV = "NEXTCLOUD_TALK_FEDERATED_MEDIA"
 FEDERATED_LINK_DAYS = 7
 
+# Team role from the account's Nextcloud profile (Settings > Personal info, or
+# an admin in user management): edit an agent's job there, not on its host.
+PROFILE_ROLE_ENV = "NEXTCLOUD_TALK_PROFILE_ROLE"
+PROFILE_REFRESH_SECONDS = 300
+_PROFILE_FIELDS = (
+    ("role", "Role"),
+    ("headline", "Headline"),
+    ("organisation", "Organisation"),
+    ("pronouns", "Pronouns"),
+    ("biography", "About"),
+)
+MAX_PROFILE_PROMPT_CHARS = 4000
+
 
 def _file_parameters(parameters: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The ``file`` rich objects of a Talk message, in placeholder order."""
@@ -417,6 +432,42 @@ def _media_kind(mime: str, is_voice: bool) -> str:
         if mime.startswith(prefix + "/"):
             return prefix
     return "document"
+
+
+def _profile_lines(profile: Dict[str, Any]) -> List[str]:
+    return [
+        f"{label}: {str(profile.get(key)).strip()}"
+        for key, label in _PROFILE_FIELDS
+        if str(profile.get(key) or "").strip()
+    ]
+
+
+def _build_role_prompt(
+    own: Optional[Dict[str, Any]], teammates: Optional[Dict[str, Dict[str, Any]]] = None
+) -> Optional[str]:
+    """System-level note built from Nextcloud profiles: who you are on this team.
+
+    Empty profiles add nothing, so an unconfigured account behaves as before.
+    """
+    parts: List[str] = []
+    own_lines = _profile_lines(own or {})
+    if own_lines:
+        parts.append(
+            "[Your role on this team, from your Nextcloud profile. The team edits it "
+            "there; follow it alongside your own identity.]\n" + "\n".join(own_lines)
+        )
+    mates = []
+    for uid, prof in sorted((teammates or {}).items()):
+        lines = _profile_lines(prof)
+        if lines:
+            name = str(prof.get("displayname") or uid).strip()
+            mates.append(f"- {name} ({uid}): " + "; ".join(lines))
+    if mates:
+        parts.append("[Your agent teammates and their roles, from their profiles]\n" + "\n".join(mates))
+    if not parts:
+        return None
+    prompt = "\n\n".join(parts)
+    return prompt[:MAX_PROFILE_PROMPT_CHARS]
 
 
 def _strip_leading_self_mention(text: str, own_user_id: str, own_display_name: str) -> str:
@@ -665,6 +716,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         # room token -> {message id: its line in _room_context}, so an edit or
         # deletion of a still-unanswered message updates the backlog in place
         self._room_context_ids: Dict[str, Dict[str, str]] = {}
+        raw_role = extra.get("profile_role")
+        if raw_role is None:
+            raw_role = os.getenv(PROFILE_ROLE_ENV, "on")
+        self._profile_role_enabled: bool = str(raw_role).strip().lower() not in ("0", "off", "false", "no")
+        self._role_prompt: Optional[str] = None
+        self._profile_fetched_at: float = 0.0
         # Talk cannot share a file into a federated conversation. "link" uploads
         # to the agent's own Files and posts an expiring public link instead;
         # off by default because a public link is readable by anyone who has it.
@@ -757,6 +814,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             try:
                 await self._discover_rooms()
                 await self._discover_invitations()
+                await self._refresh_profile_role()
                 backoff_idx = 0
             except asyncio.CancelledError:
                 return
@@ -770,6 +828,52 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 return
+
+    async def _refresh_profile_role(self, force: bool = False) -> None:
+        """Re-read the role prompt from Nextcloud profiles every few minutes.
+
+        Own profile plus the local accounts in NEXTCLOUD_TALK_AGENT_USERS.
+        A federated teammate's profile lives on another server and is skipped.
+        A failed read keeps the last good prompt.
+        """
+        if not self._profile_role_enabled or not self._http_client:
+            return
+        if not force and time.time() - self._profile_fetched_at < PROFILE_REFRESH_SECONDS:
+            return
+        own = await self._fetch_profile(self._username)
+        if own is None:
+            return
+        teammates: Dict[str, Dict[str, Any]] = {}
+        for uid in sorted(self._agent_users):
+            if "@" in uid or uid == self._username.lower():
+                continue
+            prof = await self._fetch_profile(uid)
+            if prof:
+                teammates[uid] = prof
+        prompt = _build_role_prompt(own, teammates)
+        if prompt != self._role_prompt:
+            logger.info("[%s] team role prompt %s (%d chars)", self.name,
+                        "updated" if prompt else "cleared", len(prompt or ""))
+        self._role_prompt = prompt
+        self._profile_fetched_at = time.time()
+
+    async def _fetch_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            resp = await self._http_client.get(
+                f"/ocs/v2.php/cloud/users/{quote(user_id)}", params={"format": "json"})
+        except Exception as e:
+            logger.debug("[%s] profile %s: %s", self.name, user_id, e)
+            return None
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("ocs", {}).get("data")
+        return data if isinstance(data, dict) else None
+
+    def _apply_role_prompt(self, event: MessageEvent) -> None:
+        if not self._role_prompt:
+            return
+        existing = getattr(event, "channel_prompt", None)
+        event.channel_prompt = f"{existing}\n\n{self._role_prompt}" if existing else self._role_prompt
 
     async def _discover_rooms(self) -> None:
         resp = await self._http_client.get(
@@ -1001,6 +1105,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if shared_files:
             await self._attach_files(event, shared_files, message)
 
+        self._apply_role_prompt(event)
+
         if is_command:
             # Slash commands (/sethome, /new ...) go to the core verbatim: any
             # prefix would stop it recognising the command. Backlog is kept
@@ -1208,6 +1314,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
         )
+        self._apply_role_prompt(digest_event)
         await self.handle_message(digest_event)
 
     # -- Outbound messaging --------------------------------------------------

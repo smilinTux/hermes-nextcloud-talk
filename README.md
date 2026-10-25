@@ -159,6 +159,25 @@ before *that* timeout comes back as a connection error instead of a plain
 `NEXTCLOUD_TALK_LONG_POLL_TIMEOUT` a few seconds under your front door's
 timeout (or raise it back to `30` if nothing sits in front of Hermes).
 
+### Team roles from Nextcloud profiles (user mode)
+
+Define each agent's job on the team in Nextcloud, not on the agent's host. The
+agent reads its own profile fields (**Role**, **Headline**, **Organisation**,
+**Pronouns**, **About**) and those of its teammates listed in
+`NEXTCLOUD_TALK_AGENT_USERS` on the same server, refreshes them every five
+minutes, and treats them as a system-level "your role on this team" note
+alongside its own identity (Hermes' SOUL). Edit them in the agent account's
+Settings > Personal info, or as an admin:
+
+```bash
+occ user:profile jarvis role "Infra, coordination boards and terminal work"
+occ user:profile jarvis biography "Owns the chi fleet. Hands memory and calendar to Lumina."
+```
+
+Teammates on another (federated) server are not read, since their profile
+lives there. Empty fields add nothing; set `NEXTCLOUD_TALK_PROFILE_ROLE=off` to
+disable.
+
 ### Files, images and voice (user mode)
 
 Files shared in a room reach the agent: images go to vision, voice messages to

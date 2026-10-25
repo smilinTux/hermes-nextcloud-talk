@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.7.0] - 2026-10-25
+
+### Added
+
+- Team roles from Nextcloud profiles. The agent reads its own profile (Role,
+  Headline, Organisation, Pronouns, About) and the profiles of local accounts
+  in `NEXTCLOUD_TALK_AGENT_USERS`, every five minutes, and passes them to the
+  core as `channel_prompt` (a system-level note, not part of the transcript).
+  Changing an agent's job on the team is now a profile edit, by the agent's
+  account or an admin (`occ user:profile <uid> role "..."`), with no change on
+  the agent host. Empty profiles add nothing; `NEXTCLOUD_TALK_PROFILE_ROLE=off`
+  disables it.
+
 ## [1.6.0] - 2026-10-25
 
 ### Added
