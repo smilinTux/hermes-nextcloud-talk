@@ -306,8 +306,45 @@ TOOLS = (
 )
 
 
+_TOOL_SEARCH_MODULE = "tools.tool_search"
+_DIRECT_ATTR = "_DIRECT_SURFACE_TOOLSETS"
+
+
+def pin_visible() -> bool:
+    """Keep the ``nctalk-calls`` toolset out of Hermes tool_search deferral.
+
+    Hermes progressive disclosure (``tools/tool_search.py``) defers EVERY plugin
+    tool behind ``tool_search`` / ``tool_describe`` / ``tool_call`` unless its
+    toolset is in ``_DIRECT_SURFACE_TOOLSETS``; ``register_tool`` has no
+    per-tool flag and ``tools.tool_search.defer`` in config.yaml can only ADD
+    tools to the deferred set, never pin one eager. Deferred, the call tools
+    only appear as bare names in a 240-tool listing, and the model reaches for
+    ``terminal`` instead (seen live: "@lumina join call" -> a hand-built venv
+    and ``systemd-run ... skcall join``). Three schemas cost ~560 tokens.
+
+    ``is_deferrable_tool_name`` reads the module global on every call, so
+    rebinding it (frozenset, idempotent) is enough. Best effort: if the Hermes
+    internals ever move, the tools still work, just deferred again.
+    """
+    try:
+        import importlib
+        ts = importlib.import_module(_TOOL_SEARCH_MODULE)
+        current = getattr(ts, _DIRECT_ATTR)
+        if TOOLSET not in current:
+            setattr(ts, _DIRECT_ATTR, frozenset(current) | {TOOLSET})
+        return True
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "nctalk: could not pin %s visible; call tools stay behind tool_search", TOOLSET,
+            exc_info=True)
+        return False
+
+
 def register_tools(ctx) -> None:
     """Register the call tools in the ``nctalk-calls`` toolset, gated on NEXTCLOUD_TALK_CALL_TOOLS."""
     for name, schema, handler, emoji in TOOLS:
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji, check_fn=tools_enabled)
+    # Harmless when the tools are off: check_fn drops them before tool_search sees them.
+    pin_visible()

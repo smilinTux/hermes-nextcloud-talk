@@ -773,3 +773,31 @@ async def test_watch_tick_with_only_unlisted_senders_dispatches_nothing():
 def test_bot_platform_name_is_nctalk():
     adapter = NextcloudTalkAdapter(make_config())
     assert adapter.platform.value == "nctalk"
+
+
+@pytest.mark.asyncio
+async def test_call_tools_line_on_bot_channel_prompt(monkeypatch):
+    import adapter as bot_adapter
+    monkeypatch.setenv("NEXTCLOUD_TALK_CALL_TOOLS", "on")
+    adapter = NextcloudTalkAdapter(make_config(rooms={"room1": {"mode": "free"}}))
+    app = web.Application()
+    app.router.add_post(adapter._path, adapter._handle_webhook)
+    async with TestClient(TestServer(app)) as c:
+        await _post_webhook(c, create_payload(message="join call", msg_id="1"))
+        await asyncio.sleep(0)
+    prompt = adapter.handled_events[0].channel_prompt
+    assert prompt.startswith(bot_adapter._PLATFORM_HINT)
+    assert prompt.endswith(bot_adapter.CALL_TOOLS_PROMPT)
+
+
+@pytest.mark.asyncio
+async def test_bot_channel_prompt_unchanged_when_call_tools_off(monkeypatch):
+    import adapter as bot_adapter
+    monkeypatch.delenv("NEXTCLOUD_TALK_CALL_TOOLS", raising=False)
+    adapter = NextcloudTalkAdapter(make_config(rooms={"room1": {"mode": "free"}}))
+    app = web.Application()
+    app.router.add_post(adapter._path, adapter._handle_webhook)
+    async with TestClient(TestServer(app)) as c:
+        await _post_webhook(c, create_payload(message="hi", msg_id="1"))
+        await asyncio.sleep(0)
+    assert adapter.handled_events[0].channel_prompt == bot_adapter._PLATFORM_HINT

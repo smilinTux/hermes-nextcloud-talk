@@ -202,3 +202,68 @@ def test_descriptions_have_no_long_dashes():
     for _, schema, _, _ in ct.TOOLS:
         assert "\u2014" not in json.dumps(schema, ensure_ascii=False)
         assert "\u2013" not in json.dumps(schema, ensure_ascii=False)
+
+
+# ------------------------------------------------- tool_search visibility pin
+import sys  # noqa: E402
+import types  # noqa: E402
+
+
+def _fake_tool_search(monkeypatch, direct=frozenset({"project", "desktop_ui"})):
+    mod = types.ModuleType("tools.tool_search")
+    mod._DIRECT_SURFACE_TOOLSETS = direct
+    monkeypatch.setitem(sys.modules, "tools.tool_search", mod)
+    return mod
+
+
+def test_pin_visible_adds_toolset_to_direct_surface(monkeypatch):
+    mod = _fake_tool_search(monkeypatch)
+    assert ct.pin_visible() is True
+    assert mod._DIRECT_SURFACE_TOOLSETS == frozenset({"project", "desktop_ui", "nctalk-calls"})
+    assert isinstance(mod._DIRECT_SURFACE_TOOLSETS, frozenset)
+
+
+def test_pin_visible_is_idempotent(monkeypatch):
+    mod = _fake_tool_search(monkeypatch)
+    ct.pin_visible()
+    first = mod._DIRECT_SURFACE_TOOLSETS
+    ct.pin_visible()
+    assert mod._DIRECT_SURFACE_TOOLSETS is first
+
+
+def test_pin_visible_degrades_when_hermes_internals_move(monkeypatch):
+    mod = types.ModuleType("tools.tool_search")  # attribute renamed/removed upstream
+    monkeypatch.setitem(sys.modules, "tools.tool_search", mod)
+    assert ct.pin_visible() is False
+
+
+def test_register_tools_pins_visible(monkeypatch):
+    mod = _fake_tool_search(monkeypatch)
+
+    class Ctx:
+        def register_tool(self, **kw):
+            pass
+    ct.register_tools(Ctx())
+    assert "nctalk-calls" in mod._DIRECT_SURFACE_TOOLSETS
+
+
+@pytest.mark.skipif(not os.getenv("HERMES_AGENT_SRC"), reason="set HERMES_AGENT_SRC to a hermes-agent checkout")
+def test_pin_against_real_hermes_tool_search():
+    """Runs the real Hermes classifier in a subprocess. HERMES_AGENT_PYTHON must be the
+    python of an environment that already has Hermes' dependencies (its runtime venv)."""
+    src = os.environ["HERMES_AGENT_SRC"]
+    py = os.getenv("HERMES_AGENT_PYTHON", "python3")
+    code = (
+        "import sys, importlib.util; sys.path.insert(0, %r)\n"
+        "from tools.registry import registry\n"
+        "import tools.tool_search as ts\n"
+        "registry.register(name='call_join', toolset='nctalk-calls', schema={'name':'call_join',"
+        "'description':'x','parameters':{'type':'object','properties':{}}}, handler=lambda a, **k: '')\n"
+        "before = ts.is_deferrable_tool_name('call_join')\n"
+        "spec = importlib.util.spec_from_file_location('ct', %r); m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m); ok = m.pin_visible()\n"
+        "print(before, ok, ts.is_deferrable_tool_name('call_join'))\n"
+    ) % (src, os.path.join(_ROOT, "tools.py"))
+    out = subprocess.run([py, "-c", code], capture_output=True, text=True, cwd=src, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.split()[-3:] == ["True", "True", "False"]

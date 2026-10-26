@@ -78,6 +78,27 @@ def _secret(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+# Matches tools.py (repeated here so each connector still deploys standalone).
+CALL_TOOLS_PROMPT = (
+    "For joining, leaving or checking voice calls, always use call_join / "
+    "call_leave / call_status; never start skcall from the terminal."
+)
+
+
+def _call_tools_prompt() -> str:
+    """The call-tools line when NEXTCLOUD_TALK_CALL_TOOLS is on, else ""."""
+    on = _secret("NEXTCLOUD_TALK_CALL_TOOLS", "").strip().lower() in ("1", "on", "true", "yes")
+    return CALL_TOOLS_PROMPT if on else ""
+
+
+def _with_call_tools_prompt(prompt: Optional[str]) -> Optional[str]:
+    """Append the call-tools line (when on) to a channel prompt."""
+    line = _call_tools_prompt()
+    if not line:
+        return prompt
+    return f"{prompt}\n\n{line}" if prompt else line
+
+
 try:  # drop-in plugin layout: core.py is this file's sibling in the
     # package (~/.hermes/plugins/nctalk_bot/{__init__,adapter,core}.py)
     from .core import (
@@ -465,7 +486,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 message_type=MessageType.TEXT,
                 source=source,
                 message_id=parsed.message_id,
-                channel_prompt=_PLATFORM_HINT,
+                channel_prompt=_with_call_tools_prompt(_PLATFORM_HINT),
             )
             task = asyncio.create_task(self.handle_message(event))
             self._background_tasks.add(task)
@@ -530,7 +551,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 text=f"[New messages since last review]\n{lines}",
                 message_type=MessageType.TEXT,
                 source=source,
-                channel_prompt=watch_prompt,
+                channel_prompt=_with_call_tools_prompt(watch_prompt),
             )
             buf.mark_watch_seen()
             self._watch_last_dispatch[room_token] = now
