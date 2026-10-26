@@ -200,5 +200,5 @@ def test_register_tools_gated():
 
 def test_descriptions_have_no_long_dashes():
     for _, schema, _, _ in ct.TOOLS:
-        assert "—" not in json.dumps(schema, ensure_ascii=False)
-        assert "–" not in json.dumps(schema, ensure_ascii=False)
+        assert "\u2014" not in json.dumps(schema, ensure_ascii=False)
+        assert "\u2013" not in json.dumps(schema, ensure_ascii=False)

@@ -60,6 +60,8 @@ def tools_enabled() -> bool:
 
 
 def _session(name: str) -> str:
+    # Hermes has no public plugin seam for the current turn's chat yet; this is
+    # the accessor its own tools use. Guarded: without it the room is required.
     try:
         from gateway.session_context import get_session_env  # type: ignore
         return get_session_env(name, "") or ""
