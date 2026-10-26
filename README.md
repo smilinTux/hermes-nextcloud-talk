@@ -32,7 +32,16 @@ Both modes support three per-room behaviors:
 |---|---|
 | `mention` (default) | Reply only when the agent is @-mentioned (rich mention parameter, or plain-text `@name`/`@"Display Name"`). |
 | `watch` | Buffer every message; a periodic background task decides whether anything is worth saying (reply with the literal token `NO_REPLY` to say nothing -- the adapter intercepts and discards it). |
-| `free` | Reply to every message (a dedicated room for the agent). DMs always run in `free` mode in user mode, since a DM has no third party to be quiet in front of. |
+| `free` | Reply to every message (a dedicated room for the agent). |
+
+In user mode, rooms not listed in `NEXTCLOUD_TALK_ROOM_MODES` that are one-to-one
+conversations (Talk room type 1 or 5), or group conversations whose only participants
+are the agent and exactly one user from `NEXTCLOUD_TALK_ALLOWED_USERS`, run in
+`NEXTCLOUD_TALK_DM_MODE` (default `free`): there is no third party to be quiet in front
+of. A group room's participants are re-read every 5 minutes and whenever someone joins
+or leaves, so a third participant drops it back to `mention`. Set
+`NEXTCLOUD_TALK_DM_MODE=mention` to require an @mention there too. A room listed in
+`NEXTCLOUD_TALK_ROOM_MODES` always uses its listed mode.
 
 ## Which mode do I want?
 

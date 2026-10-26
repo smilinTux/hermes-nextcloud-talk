@@ -30,6 +30,10 @@ Environment variables (env wins over config.yaml ``extra``):
     NEXTCLOUD_TALK_DISPLAY_NAME             Display name for plain-text mentions (default: Hermes)
     NEXTCLOUD_TALK_ALLOWED_INVITERS        Federation inviters to auto-accept from
     NEXTCLOUD_TALK_ROOM_MODES              "token1=mention,token2=watch,token3=free"
+    NEXTCLOUD_TALK_DM_MODE                 Mode for unlisted one-to-one rooms and for group rooms
+                                             whose only participants are this account and one
+                                             allowed user (default "free"; "mention" restores the
+                                             old @mention requirement there)
     NEXTCLOUD_TALK_FEDERATED_MEDIA         "link" posts an expiring public link for files in federated
                                              rooms (Talk cannot share into them); default "off"
     NEXTCLOUD_TALK_PROFILE_ROLE            "off" stops reading the agent's role from its Nextcloud
@@ -62,7 +66,8 @@ Environment variables (env wins over config.yaml ``extra``):
 
 Active listening and the agent-to-agent loop guard only matter in a room
 with more than one participant (DMs are always addressed to this account,
-so neither applies there).
+so neither applies there). Unlisted DMs, and group rooms holding only this
+account and one allowed user, run in NEXTCLOUD_TALK_DM_MODE (default free).
 """
 
 import asyncio
@@ -75,7 +80,7 @@ from datetime import datetime, timezone
 import json
 import mimetypes
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 try:
@@ -184,6 +189,22 @@ ROOM_MODE_WATCH = "watch"
 ROOM_MODE_FREE = "free"
 VALID_ROOM_MODES = frozenset({ROOM_MODE_MENTION, ROOM_MODE_WATCH, ROOM_MODE_FREE})
 
+# One-to-one rooms, and group rooms that are a private pair in practice
+# (Talk types a conversation Chef made with just himself and Jarvis as a
+# group, type 2), run in this mode unless NEXTCLOUD_TALK_ROOM_MODES lists them.
+DM_MODE_ENV = "NEXTCLOUD_TALK_DM_MODE"
+DEFAULT_DM_MODE = ROOM_MODE_FREE
+# A group room's participant list is re-read this often, and at once when the
+# room posts a participant-change system message.
+PAIR_REFRESH_SECONDS = 300.0
+PARTICIPANT_CHANGE_MESSAGES = frozenset({
+    "user_added", "user_removed",
+    "federated_user_added", "federated_user_removed",
+    "group_added", "group_removed",
+    "circle_added", "circle_removed",
+    "guest_joined", "guest_left",
+})
+
 # Agent-to-agent loop guard. A "free" room replies to every human message,
 # but two free agents replying to each other would never stop. So a message
 # from another agent (NEXTCLOUD_TALK_AGENT_USERS, or any Talk webhook bot)
@@ -279,6 +300,39 @@ def _room_mode(token: str, display_name: Optional[str], modes_map: Dict[str, str
         if match:
             return match.group(1).lower()
     return modes_map.get(token, ROOM_MODE_MENTION)
+
+
+def _is_pair_participants(
+    participants: List[Dict[str, Any]],
+    username: str,
+    allowed_users: frozenset,
+    agent_users: frozenset,
+) -> bool:
+    """True when the room holds exactly this account plus one allowed human.
+
+    The human must be listed in NEXTCLOUD_TALK_ALLOWED_USERS (allow-all does
+    not count) and must not be another agent, so the agent-to-agent loop
+    guard never meets a pair room.
+    """
+    if len(participants) != 2:
+        return False
+    me = (username or "").lower()
+    others = [
+        p for p in participants
+        if not (p.get("actorType") == "users" and (p.get("actorId") or "").lower() == me)
+    ]
+    if len(others) != 1:
+        return False
+    other = others[0]
+    if other.get("actorType") not in ("users", "federated_users"):
+        return False
+    actor_id = other.get("actorId") or ""
+    if actor_id.startswith("federated_users/"):
+        actor_id = actor_id[len("federated_users/"):]
+    actor_id = actor_id.lower()
+    if not actor_id or actor_id not in allowed_users:
+        return False
+    return not _is_agent_actor({"id": actor_id, "type": other.get("actorType")}, agent_users)
 
 
 def _parse_allowlist(raw: Optional[str]) -> frozenset:
@@ -779,6 +833,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._allow_all_users = _truthy(
             extra.get("allow_all_users") or os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
         )
+        dm_mode = str(extra.get("dm_mode") or os.getenv(DM_MODE_ENV, "") or DEFAULT_DM_MODE)
+        dm_mode = dm_mode.strip().lower()
+        if dm_mode not in VALID_ROOM_MODES:
+            logger.warning("[%s] %s=%r is not a room mode, using %s", PLATFORM_NAME,
+                           DM_MODE_ENV, dm_mode, DEFAULT_DM_MODE)
+            dm_mode = DEFAULT_DM_MODE
+        self._dm_mode: str = dm_mode
+        # token -> (is a pair room, when last read)
+        self._pair_rooms: Dict[str, Tuple[bool, float]] = {}
 
     # -- Connection lifecycle -------------------------------------------
 
@@ -913,6 +976,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 continue
             live_tokens.add(token)
             self._room_meta[token] = room
+            await self._refresh_pair_room(token)
             if token not in self._room_tasks or self._room_tasks[token].done():
                 federated = " [federated via %s]" % room["remoteServer"] if room.get("remoteServer") else ""
                 logger.info(
@@ -925,6 +989,52 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             if token not in live_tokens:
                 self._room_tasks.pop(token).cancel()
                 self._room_meta.pop(token, None)
+                self._pair_rooms.pop(token, None)
+
+    async def _refresh_pair_room(self, token: str, force: bool = False) -> None:
+        """Re-read whether a group room is just this account and one allowed human.
+
+        Only local group rooms the operator did not list are checked; a listed
+        room keeps its listed mode. Every participant counts (guest, group,
+        federated user). A failed read fails closed: the room is treated as a
+        group (mention) until a read succeeds.
+        """
+        room = self._room_meta.get(token) or {}
+        if (
+            room.get("type") != ROOM_TYPE_GROUP
+            or room.get("remoteServer")
+            or token in self._room_modes
+            or self._http_client is None
+        ):
+            self._pair_rooms.pop(token, None)
+            return
+        cached = self._pair_rooms.get(token)
+        if cached and not force and time.time() - cached[1] < PAIR_REFRESH_SECONDS:
+            return
+        try:
+            resp = await self._http_client.get(
+                f"/ocs/v2.php/apps/spreed/api/v4/room/{token}/participants",
+                params={"format": "json"},
+            )
+            resp.raise_for_status()
+            participants = resp.json().get("ocs", {}).get("data", []) or []
+            is_pair = _is_pair_participants(
+                participants, self._username, self._allowed_users, self._agent_users
+            )
+        except Exception as e:
+            logger.debug("[%s] participants of %s: %s", self.name, token, e)
+            is_pair = False
+        if cached is None or cached[0] != is_pair:
+            logger.info(
+                "[%s] room %s %s a private pair with one allowed user (%s mode)",
+                self.name, token, "is" if is_pair else "is not",
+                self._dm_mode if is_pair else ROOM_MODE_MENTION,
+            )
+        self._pair_rooms[token] = (is_pair, time.time())
+
+    def _is_pair_room(self, token: str) -> bool:
+        cached = self._pair_rooms.get(token)
+        return bool(cached and cached[0])
 
     async def _discover_invitations(self) -> None:
         resp = await self._http_client.get(
@@ -1043,6 +1153,10 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # current instead of handing over its first draft.
             self._apply_backlog_edit(token, message)
             return
+        if message.get("systemMessage") in PARTICIPANT_CHANGE_MESSAGES:
+            # Someone joined or left: a pair room with a third person in it
+            # must drop back to mention before that person's first message.
+            await self._refresh_pair_room(token, force=True)
         if message.get("messageType") not in (None, "comment", "voice-message"):
             # Skip system messages (join/leave/call events etc).
             return
@@ -1059,9 +1173,10 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         room_type = room.get("type")
         display_name = room.get("displayName") or room.get("name")
         chat_type = _room_chat_type(room_type)
-        mode = ROOM_MODE_FREE if chat_type == "dm" else _room_mode(
-            token, display_name, self._room_modes
-        )
+        if token not in self._room_modes and (chat_type == "dm" or self._is_pair_room(token)):
+            mode = self._dm_mode
+        else:
+            mode = _room_mode(token, display_name, self._room_modes)
 
         mentioned = _is_mention(
             text, message.get("messageParameters"), self._username, self._display_name
