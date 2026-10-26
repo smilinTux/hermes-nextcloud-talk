@@ -108,7 +108,8 @@ def _secret(name: str, default: str = "") -> str:
 # Matches tools.py (repeated here so each connector still deploys standalone).
 CALL_TOOLS_PROMPT = (
     "For joining, leaving or checking voice calls, always use call_join / "
-    "call_leave / call_status; never start skcall from the terminal."
+    "call_leave / call_status; never start skcall from the terminal. Leave their "
+    "room argument empty to mean this chat."
 )
 
 

@@ -217,7 +217,7 @@ With `NEXTCLOUD_TALK_CALL_TOOLS=on` the agent gets three tools (toolset
 `nctalk-calls`) so "@agent join call" works without the agent improvising a
 process in the terminal:
 
-- `call_join(room?, ring=false, greeting?)` starts the
+- `call_join(room?, other_room=false, ring=false, greeting?)` starts the
   `skcall-join@<room>.service` systemd --user unit and returns at once with
   `joining` or `already in call`. It is never a background process the agent
   watches or restarts.
@@ -225,7 +225,11 @@ process in the terminal:
 - `call_status(room?)` reports in call / not in call / the last failure.
 
 `room` defaults to the Talk chat the request came from and must match
-`^[a-z0-9]{4,32}$`. `ring` and `greeting` are handed to the unit through
+`^[a-z0-9]{4,32}$`. Invoked from a Talk chat, the tools act on that chat: a
+different explicit `room` is ignored (the result's `room_note` says so) unless
+the call also sets `other_room: true`, because models tend to fill `room` with
+whatever token they can see, such as the home channel. Outside Talk, `room` is
+required. `ring` and `greeting` are handed to the unit through
 `$XDG_RUNTIME_DIR/skcall/join-<room>.env`. The unit and the call itself come
 from [skcall](https://github.com/smilinTux/skcall) (`systemd/skcall-join@.service`),
 which also guarantees one instance per agent and room and posts a summary to

@@ -4,6 +4,23 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.8.2] - 2026-10-26
+
+### Fixed
+
+- The call tools could act on the wrong room. "@jarvis join call" in one Talk
+  room started the call in another: the model passed `room` explicitly, filled
+  from the only room token it could see in its context (the Talk home channel,
+  listed under "Home Channels" in the Hermes session context), and an explicit
+  `room` always won. Invoked from a Talk room, `call_join`, `call_leave` and
+  `call_status` now act on that room; a different explicit `room` is ignored
+  unless the args also set `other_room: true`, and the result carries a
+  `room_note` saying which room was used and why.
+- Tool descriptions and the Talk channel prompt now say to leave `room` empty
+  to mean this chat, and never to fill it from a home channel or memory.
+- The "already in call" note was gendered ("She is ..."); it is now
+  agent-neutral ("You are already in this call").
+
 ## [1.8.1] - 2026-10-25
 
 ### Fixed

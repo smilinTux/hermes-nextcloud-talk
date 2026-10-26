@@ -267,3 +267,116 @@ def test_pin_against_real_hermes_tool_search():
     out = subprocess.run([py, "-c", code], capture_output=True, text=True, cwd=src, timeout=120)
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.split()[-3:] == ["True", "True", "False"]
+
+
+# --------------------------------------- room resolution from inside a Talk room
+# Regression: "@jarvis join call" in room yr3xaj4t; the model passed the home
+# channel token (og63pxfh, listed in the session context) as room, and the call
+# started in the wrong room.
+HERE, HOME = "yr3xaj4t", "og63pxfh"
+
+
+@pytest.fixture
+def in_talk(sysd, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "nctalk")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", HERE)
+    return sysd
+
+
+def _started(sysd):
+    return [c[-1] for c in sysd.cmds if c[:3] == ["systemctl", "--user", "start"]]
+
+
+def test_talk_room_no_room_arg_joins_current(in_talk):
+    r = j(ct.call_join({}))
+    assert r["room"] == HERE and r["status"] == "joining" and "room_note" not in r
+    assert _started(in_talk) == [f"skcall-join@{HERE}.service"]
+
+
+def test_talk_room_same_room_explicit(in_talk):
+    r = j(ct.call_join({"room": HERE}))
+    assert r["room"] == HERE and "room_note" not in r
+    assert _started(in_talk) == [f"skcall-join@{HERE}.service"]
+
+
+def test_talk_room_different_room_without_override_joins_current(in_talk):
+    r = j(ct.call_join({"room": HOME, "ring": False, "greeting": "Jarvis here."}))
+    assert r["room"] == HERE and r["status"] == "joining"
+    assert HERE in r["room_note"] and HOME in r["room_note"] and "other_room" in r["room_note"]
+    assert _started(in_talk) == [f"skcall-join@{HERE}.service"]
+    assert not ct.env_file(HOME).exists() and ct.env_file(HERE).exists()
+
+
+@pytest.mark.parametrize("flag", [False, "false", "no", None])
+def test_talk_room_falsy_override_is_no_override(in_talk, flag):
+    assert j(ct.call_join({"room": HOME, "other_room": flag}))["room"] == HERE
+
+
+def test_talk_room_different_room_with_override_joins_that_room(in_talk):
+    r = j(ct.call_join({"room": HOME, "other_room": True}))
+    assert r["room"] == HOME and r["status"] == "joining"
+    assert HOME in r["room_note"] and HERE in r["room_note"]
+    assert _started(in_talk) == [f"skcall-join@{HOME}.service"]
+
+
+def test_talk_room_invalid_room_without_override_uses_current(in_talk):
+    # e.g. the model passes the room's display name; it is ignored, not an error
+    assert j(ct.call_join({"room": "Jarvis test"}))["room"] == HERE
+
+
+def test_talk_room_invalid_room_with_override_rejected(in_talk):
+    assert "invalid room token" in j(ct.call_join({"room": "Jarvis test", "other_room": True}))["error"]
+    assert in_talk.cmds == []
+
+
+def test_non_talk_context_without_room_errors(sysd, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "-1003899092893")
+    for fn in (ct.call_join, ct.call_leave):
+        assert "room is required" in j(fn({}))["error"]
+    assert sysd.cmds == []
+
+
+def test_non_talk_context_explicit_room_needs_no_override(sysd, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "-1003899092893")
+    r = j(ct.call_join({"room": HOME}))
+    assert r["room"] == HOME and "room_note" not in r
+
+
+def test_talk_room_leave_guarded(in_talk):
+    in_talk.states[f"skcall-join@{HERE}.service"] = ACTIVE
+    in_talk.states[f"skcall-join@{HOME}.service"] = ACTIVE
+    r = j(ct.call_leave({"room": HOME}))
+    assert r["room"] == HERE and r["status"] == "leaving" and "room_note" in r
+    stops = [c[-1] for c in in_talk.cmds if c[:3] == ["systemctl", "--user", "stop"]]
+    assert stops == [f"skcall-join@{HERE}.service"]
+
+
+def test_talk_room_leave_other_room_with_override(in_talk):
+    in_talk.states[f"skcall-join@{HOME}.service"] = ACTIVE
+    r = j(ct.call_leave({"room": HOME, "other_room": True}))
+    assert r["room"] == HOME and r["status"] == "leaving"
+
+
+def test_talk_room_status_guarded(in_talk):
+    in_talk.states[f"skcall-join@{HERE}.service"] = ACTIVE
+    r = j(ct.call_status({"room": HOME}))
+    assert r["room"] == HERE and r["status"] == "in call" and "room_note" in r
+    assert j(ct.call_status({"room": HOME, "other_room": True}))["room"] == HOME
+
+
+def test_already_in_call_note_is_agent_neutral(in_talk):
+    in_talk.states[f"skcall-join@{HERE}.service"] = ACTIVE
+    note = j(ct.call_join({}))["note"]
+    assert note.startswith("You are already in this call")
+    for word in ("She ", "He ", " her ", " his "):
+        assert word not in note
+
+
+def test_schemas_steer_room_empty_and_offer_override():
+    for _, schema, _, _ in ct.TOOLS:
+        props = schema["parameters"]["properties"]
+        assert props["other_room"]["type"] == "boolean"
+        assert "empty" in props["room"]["description"].lower()
+        assert "home channel" in schema["description"].lower()
