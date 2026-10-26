@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.7.0
+version: 1.8.0
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -10,6 +10,12 @@ description: >
   configured -- see README.md. No extra SDKs: aiohttp for bot mode, httpx
   for user mode, both already Hermes dependencies.
 author: "Hermes Nextcloud Talk contributors"
+# Opt-in call tools (tools.py, toolset nctalk-calls), active only with
+# NEXTCLOUD_TALK_CALL_TOOLS=on. Declared so CLI/TUI processes register them too.
+provides_tools:
+  - call_join
+  - call_leave
+  - call_status
 requires_env: []
 optional_env:
   # -- Bot mode --
@@ -131,4 +137,12 @@ optional_env:
       as context with the next message this account does answer
       (default 40; 0 disables active listening).
     prompt: "Context backlog size (user mode, default 40, 0 disables)"
+    password: false
+  # -- Call tools (opt-in) --
+  - name: NEXTCLOUD_TALK_CALL_TOOLS
+    description: >-
+      'on' enables the call_join / call_leave / call_status tools, which
+      start and stop the skcall-join@<room> systemd --user unit (skcall repo)
+      so the agent can join a Talk call from chat (default off)
+    prompt: "Enable call tools? (on/off, needs skcall-join@.service installed)"
     password: false

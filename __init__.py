@@ -104,6 +104,15 @@ async def standalone_send(pconfig, chat_id, message, **kwargs):
 
 def register(ctx) -> None:
     """Plugin entry point -- called once by the Hermes plugin loader at startup."""
+    # Opt-in call tools (call_join / call_leave / call_status), gated by
+    # NEXTCLOUD_TALK_CALL_TOOLS=on through each tool's check_fn. Registered
+    # first and independently: a failure here must never cost the platform.
+    try:
+        from .tools import register_tools
+        register_tools(ctx)
+    except Exception:  # pragma: no cover - defensive
+        import logging
+        logging.getLogger(__name__).warning("nctalk: call tools not registered", exc_info=True)
     ctx.register_platform(
         name=_user.PLATFORM_NAME,
         label="Nextcloud Talk",
