@@ -211,6 +211,28 @@ Hermes. See [docs/nextcloud-mcp.md](docs/nextcloud-mcp.md) for a tested config
 that reuses this plugin's credentials and a read-only tool allowlist to start
 with.
 
+### Joining calls (optional, opt-in)
+
+With `NEXTCLOUD_TALK_CALL_TOOLS=on` the agent gets three tools (toolset
+`nctalk-calls`) so "@agent join call" works without the agent improvising a
+process in the terminal:
+
+- `call_join(room?, ring=false, greeting?)` starts the
+  `skcall-join@<room>.service` systemd --user unit and returns at once with
+  `joining` or `already in call`. It is never a background process the agent
+  watches or restarts.
+- `call_leave(room?)` stops that unit (a clean leave).
+- `call_status(room?)` reports in call / not in call / the last failure.
+
+`room` defaults to the Talk chat the request came from and must match
+`^[a-z0-9]{4,32}$`. `ring` and `greeting` are handed to the unit through
+`$XDG_RUNTIME_DIR/skcall/join-<room>.env`. The unit and the call itself come
+from [skcall](https://github.com/smilinTux/skcall) (`systemd/skcall-join@.service`),
+which also guarantees one instance per agent and room and posts a summary to
+the room's chat when the call ends. Without the unit installed, `call_join`
+says so and does nothing. Tool descriptions tell the model to use these tools
+for every join/leave request and never to launch skcall through the terminal.
+
 ### Federation (user mode)
 
 Nextcloud Talk supports inviting a user on another federated server into
@@ -273,6 +295,8 @@ cp user/__init__.py ~/.hermes/plugins/nctalk_user/__init__.py
   and the adapter class (it is a single, much simpler transport than the
   bot's webhook/HMAC machinery, so it was not worth splitting into a
   separate core module).
+- `tools.py` -- the opt-in call tools (`call_join`, `call_leave`,
+  `call_status`); stdlib only, tested in `tests/call_tools/`.
 - `tests/bot/`, `tests/user_mode/` -- each mode's tests (the user-mode test
   directory is not named `tests/user` to avoid shadowing the `user/`
   package on `sys.path`), against

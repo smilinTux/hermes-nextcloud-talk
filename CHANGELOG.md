@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.8.0] - 2026-10-25
+
+### Added
+
+- Opt-in call tools, `NEXTCLOUD_TALK_CALL_TOOLS=on`: `call_join`,
+  `call_leave` and `call_status` (toolset `nctalk-calls`). They start, stop
+  and inspect skcall's `skcall-join@<room>` systemd --user unit, so the agent
+  joins a Talk call from chat through one supervised unit per room instead
+  of launching skcall from the terminal (which produced duplicate tiles and
+  relaunch loops). `call_join` returns immediately with `joining` or
+  `already in call`. Room defaults to the current Talk chat; tokens are
+  validated. Ring and greeting are passed through a per-room env file.
+
 ## [1.7.0] - 2026-10-25
 
 ### Added
