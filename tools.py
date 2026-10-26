@@ -14,6 +14,13 @@ from another session (exit 3, "already in call").
 Per-call options (ring, greeting) go in ``$XDG_RUNTIME_DIR/skcall/join-<room>.env``,
 which the unit reads as an optional EnvironmentFile.
 
+Room map: ``NEXTCLOUD_TALK_CALL_ROOM_MAP=<chat room>:<estate>:<call room>,...``
+sends a call request from one chat room to a call on another estate. A
+federated room is a copy of a room hosted elsewhere, and the agent joins that
+call natively on the host: ``m4jyfpxq:nam:og63pxfh`` makes "@lumina join call"
+in nor's federated Operators AI (m4jyfpxq) start
+``skcall-join-nam@og63pxfh.service`` (skcall's ``systemd/skcall-join-nam@.service``).
+
 Kept import-light (stdlib only, no gateway imports at module level) so the
 Hermes loader can pre-register these tools in CLI/TUI processes.
 """
@@ -31,6 +38,9 @@ TOOLSET = "nctalk-calls"
 ENABLE_ENV = "NEXTCLOUD_TALK_CALL_TOOLS"
 UNIT_TEMPLATE = os.getenv("NEXTCLOUD_TALK_CALL_UNIT", "skcall-join@{room}.service")
 ROOM_RE = re.compile(r"[a-z0-9]{4,32}")
+ESTATE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+ROOM_MAP_ENV = "NEXTCLOUD_TALK_CALL_ROOM_MAP"
+MAPPED_UNIT = "skcall-join-{estate}@{room}.service"
 PLATFORM = "nctalk"
 GREETING_MAX = 300
 EXIT_ALREADY_IN_CALL = "3"
@@ -124,6 +134,33 @@ def unit_for(room: str) -> str:
     return UNIT_TEMPLATE.format(room=room)
 
 
+def room_map() -> dict:
+    """{chat room: (estate, call room)} from NEXTCLOUD_TALK_CALL_ROOM_MAP; bad entries are skipped."""
+    out = {}
+    for entry in _env(ROOM_MAP_ENV, "").split(","):
+        parts = [x.strip() for x in entry.split(":")]
+        if (len(parts) == 3 and ROOM_RE.fullmatch(parts[0]) and ESTATE_RE.fullmatch(parts[1])
+                and ROOM_RE.fullmatch(parts[2])):
+            out[parts[0]] = (parts[1], parts[2])
+    return out
+
+
+def call_target(room: str) -> tuple[str, str, str]:
+    """(call room, unit, estate) for a chat room; estate is "" when the room is not mapped."""
+    mapped = room_map().get(room)
+    if mapped:
+        estate, call_room = mapped
+        return call_room, MAPPED_UNIT.format(estate=estate, room=call_room), estate
+    return room, unit_for(room), ""
+
+
+def _target_info(room: str, call_room: str, unit: str, estate: str) -> dict:
+    out = {"room": room, "unit": unit}
+    if estate:
+        out.update(call_room=call_room, estate=estate)
+    return out
+
+
 def runtime_dir() -> Path:
     base = os.getenv("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     return Path(base) / "skcall"
@@ -166,8 +203,8 @@ def _systemctl(*args: str) -> "subprocess.CompletedProcess[str]":
     return _run(["systemctl", "--user", *args])
 
 
-def unit_state(room: str) -> dict:
-    p = _systemctl("show", unit_for(room), "--property=ActiveState,SubState,Result,ExecMainStatus,"
+def unit_state(unit: str) -> dict:
+    p = _systemctl("show", unit, "--property=ActiveState,SubState,Result,ExecMainStatus,"
                    "ActiveEnterTimestamp,LoadState")
     props = {}
     for line in (p.stdout or "").splitlines():
@@ -192,22 +229,23 @@ def call_join(args: dict, **_kw: Any) -> str:
     room, err, note = _resolve_room(args)
     if err:
         return _result(error=err)
-    unit = unit_for(room)
-    state = unit_state(room)
+    call_room, unit, estate = call_target(room)
+    info = _target_info(room, call_room, unit, estate)
+    state = unit_state(unit)
     if state.get("LoadState") == "not-found":
         return _result(error=f"{unit} is not installed on this host (skcall systemd template missing)")
     if _in_call(state):
-        return _result(**_with_note({"status": "already in call", "room": room, "unit": unit,
+        return _result(**_with_note({"status": "already in call", **info,
                                      "note": "You are already in this call. Do not start another one."},
                                     note))
     try:
-        write_env_file(room, _truthy((args or {}).get("ring")), clean_greeting((args or {}).get("greeting")))
+        write_env_file(call_room, _truthy((args or {}).get("ring")), clean_greeting((args or {}).get("greeting")))
     except OSError as e:
         return _result(error=f"could not write call options: {e}")
     p = _systemctl("start", "--no-block", unit)
     if p.returncode != 0:
         return _result(error=f"systemctl start {unit} failed: {(p.stderr or p.stdout or '').strip()[:300]}")
-    return _result(**_with_note({"status": "joining", "room": room, "unit": unit,
+    return _result(**_with_note({"status": "joining", **info,
                                  "note": ("Joining now in the background; it takes a few seconds. Do not "
                                           "run it again, do not poll, and do not start skcall any other "
                                           "way. A summary is posted to the room's chat when the call ends.")},
@@ -218,22 +256,24 @@ def call_leave(args: dict, **_kw: Any) -> str:
     room, err, note = _resolve_room(args)
     if err:
         return _result(error=err)
-    unit = unit_for(room)
-    state = unit_state(room)
+    call_room, unit, estate = call_target(room)
+    info = _target_info(room, call_room, unit, estate)
+    state = unit_state(unit)
     try:
-        env_file(room).unlink()
+        env_file(call_room).unlink()
     except (FileNotFoundError, OSError):
         pass
     if not _in_call(state):
-        return _result(**_with_note({"status": "not in call", "room": room, "unit": unit}, note))
+        return _result(**_with_note({"status": "not in call", **info}, note))
     p = _systemctl("stop", "--no-block", unit)
     if p.returncode != 0:
         return _result(error=f"systemctl stop {unit} failed: {(p.stderr or p.stdout or '').strip()[:300]}")
-    return _result(**_with_note({"status": "leaving", "room": room, "unit": unit}, note))
+    return _result(**_with_note({"status": "leaving", **info}, note))
 
 
-def _describe(room: str, state: dict) -> dict:
-    out = {"room": room, "unit": unit_for(room),
+def _describe(room: str, state: dict, unit: str = "", call_room: str = "", estate: str = "") -> dict:
+    unit = unit or unit_for(room)
+    out = {**_target_info(room, call_room or room, unit, estate),
            "state": state.get("ActiveState", "unknown"), "sub_state": state.get("SubState", "")}
     if _in_call(state):
         out["status"] = "in call"
@@ -243,7 +283,7 @@ def _describe(room: str, state: dict) -> dict:
         out["status"] = "last join failed"
         out["result"] = state.get("Result", "")
         out["exit_status"] = state.get("ExecMainStatus", "")
-        j = _run(["journalctl", "--user", "-u", unit_for(room), "-n", "6", "-o", "cat", "--no-pager"])
+        j = _run(["journalctl", "--user", "-u", unit, "-n", "6", "-o", "cat", "--no-pager"])
         tail = [ln for ln in (j.stdout or "").splitlines() if ln.strip()][-6:]
         if tail:
             out["last_log"] = tail
@@ -259,16 +299,19 @@ def call_status(args: dict, **_kw: Any) -> str:
         room, err, note = _resolve_room(args)
         if err:
             return _result(error=err)
-        return _result(**_with_note(_describe(room, unit_state(room)), note))
-    p = _systemctl("list-units", "--all", "--no-legend", "--plain", "skcall-join@*.service")
+        call_room, unit, estate = call_target(room)
+        return _result(**_with_note(_describe(room, unit_state(unit), unit, call_room, estate), note))
+    p = _systemctl("list-units", "--all", "--no-legend", "--plain", "skcall-join@*.service",
+                   "skcall-join-*@*.service")
     calls = []
     for line in (p.stdout or "").splitlines():
         parts = line.split()
         if not parts:
             continue
-        m = re.fullmatch(r"skcall-join@([a-z0-9]{4,32})\.service", parts[0])
+        m = re.fullmatch(r"skcall-join(?:-([a-z0-9][a-z0-9-]{0,31}))?@([a-z0-9]{4,32})\.service", parts[0])
         if m:
-            calls.append(_describe(m.group(1), unit_state(m.group(1))))
+            estate, call_room = m.group(1) or "", m.group(2)
+            calls.append(_describe(call_room, unit_state(parts[0]), parts[0], call_room, estate))
     return _result(calls=calls, in_call=[c["room"] for c in calls if c["status"] == "in call"])
 
 

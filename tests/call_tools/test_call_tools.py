@@ -380,3 +380,54 @@ def test_schemas_steer_room_empty_and_offer_override():
         assert props["other_room"]["type"] == "boolean"
         assert "empty" in props["room"]["description"].lower()
         assert "home channel" in schema["description"].lower()
+
+
+# ------------------------------------------------- room map (federated rooms)
+NAM_UNIT = "skcall-join-nam@og63pxfh.service"
+
+
+@pytest.fixture
+def fed(sysd, monkeypatch):
+    monkeypatch.setenv("NEXTCLOUD_TALK_CALL_ROOM_MAP", "m4jyfpxq:nam:og63pxfh, bad:x:y,abcd1234:NAM:og63pxfh")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "nctalk")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "m4jyfpxq")
+    return sysd
+
+
+def test_room_map_parses_and_skips_bad_entries(fed):
+    assert ct.room_map() == {"m4jyfpxq": ("nam", "og63pxfh")}
+    assert ct.call_target("m4jyfpxq") == ("og63pxfh", NAM_UNIT, "nam")
+    assert ct.call_target("xazze5d7") == ("xazze5d7", "skcall-join@xazze5d7.service", "")
+
+
+def test_join_from_federated_room_starts_host_estate_unit(fed):
+    r = j(ct.call_join({"ring": True}))
+    assert r["status"] == "joining" and r["room"] == "m4jyfpxq"
+    assert r["unit"] == NAM_UNIT and r["call_room"] == "og63pxfh" and r["estate"] == "nam"
+    assert ["systemctl", "--user", "start", "--no-block", NAM_UNIT] in fed.cmds
+    assert ct.env_file("og63pxfh").read_text() == "SKCALL_RING=1\n"   # %i of the nam unit
+    assert not ct.env_file("m4jyfpxq").exists()
+
+
+def test_federated_join_already_in_call_via_host_unit(fed):
+    fed.states[NAM_UNIT] = ACTIVE
+    r = j(ct.call_join({}))
+    assert r["status"] == "already in call" and r["unit"] == NAM_UNIT
+    assert "start" not in fed.verbs()
+
+
+def test_federated_status_and_leave_use_host_unit(fed):
+    fed.states[NAM_UNIT] = ACTIVE
+    s = j(ct.call_status({}))
+    assert s["status"] == "in call" and s["unit"] == NAM_UNIT and s["call_room"] == "og63pxfh"
+    r = j(ct.call_leave({}))
+    assert r["status"] == "leaving"
+    assert ["systemctl", "--user", "stop", "--no-block", NAM_UNIT] in fed.cmds
+
+
+def test_status_lists_estate_units_too(sysd):
+    sysd.states["skcall-join@xazze5d7.service"] = ACTIVE
+    sysd.states[NAM_UNIT] = ACTIVE
+    r = j(ct.call_status({}))
+    assert sorted(r["in_call"]) == ["og63pxfh", "xazze5d7"]
+    assert {c["unit"] for c in r["calls"]} == {"skcall-join@xazze5d7.service", NAM_UNIT}

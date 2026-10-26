@@ -237,6 +237,13 @@ the room's chat when the call ends. Without the unit installed, `call_join`
 says so and does nothing. Tool descriptions tell the model to use these tools
 for every join/leave request and never to launch skcall through the terminal.
 
+**Federated rooms.** A federated room is a chat copy of a room hosted on
+another Nextcloud; the call lives on the host. `NEXTCLOUD_TALK_CALL_ROOM_MAP`
+(`<chat room>:<estate>:<call room>,...`) maps such a room to the host's call:
+`m4jyfpxq:nam:og63pxfh` makes the tools drive `skcall-join-nam@og63pxfh.service`
+(the agent's native nam login, from skcall's `systemd/skcall-join-nam@.service`)
+when asked from m4jyfpxq, with options in `join-og63pxfh.env`.
+
 **Always visible, even with tool_search on.** Hermes progressive disclosure
 (`tools.tool_search`) hides every plugin tool behind `tool_search` /
 `tool_describe` / `tool_call` and shows only its bare name in a long listing.

@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.8.2
+version: 1.8.3
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -145,4 +145,12 @@ optional_env:
       start and stop the skcall-join@<room> systemd --user unit (skcall repo)
       so the agent can join a Talk call from chat (default off)
     prompt: "Enable call tools? (on/off, needs skcall-join@.service installed)"
+    password: false
+  - name: NEXTCLOUD_TALK_CALL_ROOM_MAP
+    description: >-
+      Optional comma list of <chat room>:<estate>:<call room>. A call request
+      in <chat room> (e.g. a federated copy of a room hosted elsewhere) starts
+      skcall-join-<estate>@<call room> instead of skcall-join@<chat room>, so
+      the agent joins the host's call natively. Example: m4jyfpxq:nam:og63pxfh
+    prompt: "Call room map (chat:estate:callroom, optional)"
     password: false
