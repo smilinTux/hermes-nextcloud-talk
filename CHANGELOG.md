@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.8.3] - 2026-10-26
+
+### Added
+
+- `NEXTCLOUD_TALK_CALL_ROOM_MAP=<chat room>:<estate>:<call room>,...` sends a
+  call request from one chat room to a call on another estate. Talk federation
+  carries the chat but the agent should join the host's call as its own native
+  user there: with `m4jyfpxq:nam:og63pxfh`, "@lumina join call" in nor's
+  federated Operators AI starts `skcall-join-nam@og63pxfh.service` (skcall's
+  `systemd/skcall-join-nam@.service`), and `call_leave` / `call_status` act on
+  that unit. Results add `call_room` and `estate` when a room is mapped;
+  `call_status` with no room also lists `skcall-join-<estate>@` units.
+
 ## [1.8.2] - 2026-10-26
 
 ### Fixed
