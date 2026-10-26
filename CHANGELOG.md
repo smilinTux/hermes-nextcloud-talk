@@ -4,6 +4,28 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.8.4] - 2026-10-26
+
+### Added
+
+- A group conversation whose only participants are the agent and exactly one
+  user from `NEXTCLOUD_TALK_ALLOWED_USERS` now answers without an @mention,
+  like a one-to-one room. Talk types a conversation made with just two people
+  as a group (type 2), so Chef had to @jarvis in his own chat with Jarvis. The
+  participant list is cached, re-read every 5 minutes and at once on a
+  join/leave system message; a third participant drops the room back to
+  `mention`. Every participant counts (guest, group, federated user), and a
+  failed participant read fails closed to `mention`. Federated rooms and rooms listed in `NEXTCLOUD_TALK_ROOM_MODES`
+  are not checked.
+- `NEXTCLOUD_TALK_DM_MODE` (default `free`) sets the mode for unlisted
+  one-to-one rooms and those two-person group rooms; `mention` restores the
+  @mention requirement.
+
+### Changed
+
+- A one-to-one room listed in `NEXTCLOUD_TALK_ROOM_MODES` now uses its listed
+  mode; before, DMs were always `free` whatever the list said.
+
 ## [1.8.3] - 2026-10-26
 
 ### Added

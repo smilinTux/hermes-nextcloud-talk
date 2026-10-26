@@ -46,6 +46,7 @@ from user.adapter import (
     _is_agent_actor,
     _is_mention,
     _resolve_mention_placeholders,
+    _is_pair_participants,
     _is_pending_invite,
     _is_skippable_room,
     _ocs_headers,
@@ -1242,3 +1243,170 @@ def test_no_call_tools_line_when_off(monkeypatch):
     adapter = _profile_adapter({}, profile_role="off")
     _run(adapter._on_message("tok1", _talk_message("1", "dave", "hi")))
     assert adapter.handled_events[0].channel_prompt is None
+
+
+# -- v1.8.4: DM mode for one-to-one rooms and private pair group rooms ------
+
+
+def _participant(actor_id, actor_type="users"):
+    return {"actorId": actor_id, "actorType": actor_type}
+
+
+def _pair_adapter(participants_by_call, **extra):
+    """Adapter whose participants endpoint returns successive lists from *participants_by_call*."""
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        data = participants_by_call[min(len(calls), len(participants_by_call)) - 1]
+        return httpx.Response(200, json={"ocs": {"data": data}})
+
+    extra.setdefault("allowed_users", "chef")
+    adapter = _make_adapter(**extra)
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "karvis"}
+    adapter._http_client = httpx.AsyncClient(
+        base_url="https://skhub.example", transport=httpx.MockTransport(handler))
+    return adapter, calls
+
+
+def test_unlisted_one_to_one_room_is_free_by_default():
+    adapter = _make_adapter()
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_ONE_TO_ONE, "displayName": "alice"}
+
+    _run(adapter._on_message("tok1", _talk_message("1", "alice", "hello")))
+
+    assert len(adapter.handled_events) == 1
+
+
+def test_dm_mode_mention_restores_mention_requirement_in_one_to_one_rooms():
+    adapter = _make_adapter(dm_mode="mention")
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_ONE_TO_ONE, "displayName": "alice"}
+
+    _run(adapter._on_message("tok1", _talk_message("1", "alice", "hello")))
+    assert adapter.handled_events == []
+
+    params = {"mention-user1": {"type": "user", "id": "hermes-bot", "name": "Hermes"}}
+    _run(adapter._on_message("tok1", _talk_message("2", "alice", "@hermes-bot hi", params=params)))
+    assert len(adapter.handled_events) == 1
+
+
+def test_dm_mode_env_is_read_and_bad_values_fall_back_to_free(monkeypatch):
+    monkeypatch.setenv("NEXTCLOUD_TALK_DM_MODE", "mention")
+    assert _make_adapter()._dm_mode == ROOM_MODE_MENTION
+    monkeypatch.setenv("NEXTCLOUD_TALK_DM_MODE", "loud")
+    assert _make_adapter()._dm_mode == ROOM_MODE_FREE
+
+
+def test_listed_one_to_one_room_keeps_its_listed_mode():
+    adapter = _make_adapter(room_modes="tok1=mention")
+    adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_ONE_TO_ONE, "displayName": "alice"}
+
+    _run(adapter._on_message("tok1", _talk_message("1", "alice", "hello")))
+
+    assert adapter.handled_events == []
+
+
+@pytest.mark.parametrize("participants,expected", [
+    ([_participant("hermes-bot"), _participant("chef")], True),
+    ([_participant("hermes-bot"), _participant("Chef")], True),
+    ([_participant("hermes-bot"), _participant("chef@other.example", "federated_users")], False),
+    ([_participant("hermes-bot"), _participant("mallory")], False),
+    ([_participant("hermes-bot"), _participant("chef"), _participant("bob")], False),
+    ([_participant("hermes-bot"), _participant("chef", "guests")], False),
+    ([_participant("hermes-bot")], False),
+    ([_participant("chef"), _participant("bob")], False),
+])
+def test_is_pair_participants(participants, expected):
+    assert _is_pair_participants(participants, "hermes-bot", frozenset({"chef"}), frozenset()) is expected
+
+
+def test_pair_participants_never_counts_another_agent():
+    participants = [_participant("hermes-bot"), _participant("ops-bot")]
+    assert not _is_pair_participants(
+        participants, "hermes-bot", frozenset({"ops-bot"}), frozenset({"ops-bot"}))
+
+
+def test_group_room_with_agent_and_one_allowed_human_answers_without_mention():
+    adapter, calls = _pair_adapter([[_participant("hermes-bot"), _participant("chef")]])
+
+    _run(adapter._refresh_pair_room("tok1"))
+    _run(adapter._on_message("tok1", _talk_message("1", "chef", "hello")))
+
+    assert calls == ["/ocs/v2.php/apps/spreed/api/v4/room/tok1/participants"]
+    assert len(adapter.handled_events) == 1
+    assert adapter.handled_events[0].source.chat_type == "group"
+
+
+def test_pair_room_respects_dm_mode_opt_out():
+    adapter, _ = _pair_adapter([[_participant("hermes-bot"), _participant("chef")]], dm_mode="mention")
+
+    _run(adapter._refresh_pair_room("tok1"))
+    _run(adapter._on_message("tok1", _talk_message("1", "chef", "hello")))
+
+    assert adapter.handled_events == []
+
+
+def test_group_room_with_unlisted_human_stays_mention():
+    adapter, _ = _pair_adapter([[_participant("hermes-bot"), _participant("mallory")]])
+
+    _run(adapter._refresh_pair_room("tok1"))
+    _run(adapter._on_message("tok1", _talk_message("1", "mallory", "hello")))
+
+    assert adapter.handled_events == []
+
+
+def test_third_participant_drops_pair_room_back_to_mention():
+    adapter, calls = _pair_adapter([
+        [_participant("hermes-bot"), _participant("chef")],
+        [_participant("hermes-bot"), _participant("chef"), _participant("bob")],
+    ], allowed_users="chef,bob")
+    _run(adapter._refresh_pair_room("tok1"))
+
+    added = {"id": "2", "actorId": "chef", "actorType": "users", "messageType": "system",
+             "systemMessage": "user_added", "message": "You added bob", "timestamp": 1700000000}
+    _run(adapter._on_message("tok1", added))
+    _run(adapter._on_message("tok1", _talk_message("3", "bob", "hello")))
+
+    assert len(calls) == 2
+    assert adapter.handled_events == []
+
+
+def test_pair_room_cache_is_reused_until_stale(monkeypatch):
+    adapter, calls = _pair_adapter([[_participant("hermes-bot"), _participant("chef")]])
+    now = [1000.0]
+    monkeypatch.setattr(user_adapter.time, "time", lambda: now[0])
+
+    _run(adapter._refresh_pair_room("tok1"))
+    _run(adapter._refresh_pair_room("tok1"))
+    assert len(calls) == 1
+
+    now[0] += user_adapter.PAIR_REFRESH_SECONDS + 1
+    _run(adapter._refresh_pair_room("tok1"))
+    assert len(calls) == 2
+
+
+def test_listed_and_federated_group_rooms_skip_the_participant_check():
+    adapter, calls = _pair_adapter([[_participant("hermes-bot"), _participant("chef")]],
+                                   room_modes="tok1=mention")
+    _run(adapter._refresh_pair_room("tok1"))
+    _run(adapter._on_message("tok1", _talk_message("1", "chef", "hello")))
+    assert calls == [] and adapter.handled_events == []
+
+    adapter, calls = _pair_adapter([[_participant("hermes-bot"), _participant("chef")]])
+    adapter._room_meta["tok1"]["remoteServer"] = "https://other.example"
+    _run(adapter._refresh_pair_room("tok1"))
+    assert calls == []
+
+
+def test_failed_participant_read_fails_closed_to_mention():
+    adapter, _ = _pair_adapter([[_participant("hermes-bot"), _participant("chef")]])
+    _run(adapter._refresh_pair_room("tok1"))
+
+    adapter._http_client = httpx.AsyncClient(
+        base_url="https://skhub.example",
+        transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+    _run(adapter._refresh_pair_room("tok1", force=True))
+    _run(adapter._on_message("tok1", _talk_message("1", "chef", "hello")))
+
+    assert not adapter._is_pair_room("tok1")
+    assert adapter.handled_events == []
