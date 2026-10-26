@@ -1212,3 +1212,33 @@ def test_failed_profile_read_keeps_last_good_prompt():
         base_url="https://skhub.example", transport=httpx.MockTransport(lambda r: httpx.Response(503)))
     _run(adapter._refresh_profile_role(force=True))
     assert "Role: Lead" in adapter._role_prompt
+
+
+# -- call-tools line on the channel prompt (NEXTCLOUD_TALK_CALL_TOOLS) -------
+from user import adapter as _user_adapter_mod  # noqa: E402
+
+
+def test_call_tools_line_rides_on_channel_prompt_when_on(monkeypatch):
+    monkeypatch.setenv("NEXTCLOUD_TALK_CALL_TOOLS", "on")
+    adapter = _profile_adapter({}, profile_role="off")
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "@hermes-bot join call")))
+    prompt = adapter.handled_events[0].channel_prompt
+    assert prompt == _user_adapter_mod.CALL_TOOLS_PROMPT
+    assert "call_join / call_leave / call_status" in prompt
+    assert "never start skcall from the terminal" in prompt
+
+
+def test_call_tools_line_appends_after_role(monkeypatch):
+    monkeypatch.setenv("NEXTCLOUD_TALK_CALL_TOOLS", "on")
+    adapter = _profile_adapter({"hermes-bot": {"displayname": "Hermes", "role": "Release manager"}})
+    _run(adapter._refresh_profile_role(force=True))
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "hi")))
+    prompt = adapter.handled_events[0].channel_prompt
+    assert prompt.index("Role: Release manager") < prompt.index("call_join")
+
+
+def test_no_call_tools_line_when_off(monkeypatch):
+    monkeypatch.setenv("NEXTCLOUD_TALK_CALL_TOOLS", "off")
+    adapter = _profile_adapter({}, profile_role="off")
+    _run(adapter._on_message("tok1", _talk_message("1", "dave", "hi")))
+    assert adapter.handled_events[0].channel_prompt is None

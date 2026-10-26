@@ -233,6 +233,21 @@ the room's chat when the call ends. Without the unit installed, `call_join`
 says so and does nothing. Tool descriptions tell the model to use these tools
 for every join/leave request and never to launch skcall through the terminal.
 
+**Always visible, even with tool_search on.** Hermes progressive disclosure
+(`tools.tool_search`) hides every plugin tool behind `tool_search` /
+`tool_describe` / `tool_call` and shows only its bare name in a long listing.
+Hidden that way, the model ignored the call tools and started skcall from the
+terminal. Hermes has no per-tool or config switch to keep a plugin tool eager
+(`tools.tool_search.defer` can only add tools to the deferred set), so the
+plugin adds `nctalk-calls` to the toolsets tool_search never defers
+(`_DIRECT_SURFACE_TOOLSETS` in `tools/tool_search.py`) when it registers. The
+three schemas cost about 560 tokens per turn in every session where the
+toolset is enabled; disable it per platform with `hermes tools` if you only
+want calls from Talk. If a future Hermes moves that internal, the plugin logs
+a warning and the tools still work, deferred. With the tools on, both
+connectors also add one line to the Talk channel prompt: use `call_join` /
+`call_leave` / `call_status` for calls, never start skcall from the terminal.
+
 ### Federation (user mode)
 
 Nextcloud Talk supports inviting a user on another federated server into

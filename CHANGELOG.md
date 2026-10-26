@@ -4,6 +4,21 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.8.1] - 2026-10-25
+
+### Fixed
+
+- The call tools were invisible in practice: Hermes tool_search deferred them
+  with every other plugin tool (246 deferred, names-only listing), and on
+  "@lumina join call" the agent built its own venv and ran skcall from the
+  terminal instead. The plugin now keeps the `nctalk-calls` toolset eager by
+  adding it to tool_search's never-defer toolsets at registration (Hermes has
+  no config key or per-tool flag for this). Best effort: if the internal moves
+  the tools fall back to deferred and a warning is logged.
+- With `NEXTCLOUD_TALK_CALL_TOOLS=on`, both connectors append one line to the
+  Talk channel prompt: always use `call_join` / `call_leave` / `call_status`
+  for calls, never start skcall from the terminal.
+
 ## [1.8.0] - 2026-10-25
 
 ### Added
