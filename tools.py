@@ -82,17 +82,42 @@ def _result(**data: Any) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def _resolve_room(args: dict) -> tuple[str, Optional[str]]:
-    """(room, error). An explicit room wins; otherwise the current Talk room."""
-    room = str((args or {}).get("room") or "").strip()
+OVERRIDE_ARG = "other_room"
+
+
+def _resolve_room(args: dict) -> tuple[str, Optional[str], Optional[str]]:
+    """(room, error, note) for a call tool.
+
+    Invoked from a Talk room, the tool acts on THAT room. An explicit ``room``
+    that names a different room is ignored (with a note saying so) unless the
+    args also carry ``other_room: true``: models fill ``room`` from whatever
+    token they can see (seen live: the home channel from the session context,
+    so "@jarvis join call" in one room started the call in another). Outside
+    Talk there is no current room, so ``room`` is required.
+    """
+    args = args or {}
+    explicit = str(args.get("room") or "").strip()
+    current = current_room()
+    if current and explicit and explicit != current and not _truthy(args.get(OVERRIDE_ARG)):
+        return current, None, (
+            f"Used this chat's room {current}, not {explicit!r}: the request came from Talk room "
+            f"{current}. To act on a different room, pass room plus {OVERRIDE_ARG}=true, and only "
+            "when the user explicitly asked for that other room.")
+    room = explicit or current
     if not room:
-        room = current_room()
-        if not room:
-            return "", ("room is required: give the Nextcloud Talk room token "
-                        "(the current chat is not a Talk room)")
+        return "", ("room is required: give the Nextcloud Talk room token "
+                    "(the current chat is not a Talk room)"), None
     if not ROOM_RE.fullmatch(room):
-        return "", f"invalid room token {room!r}: expected 4-32 lowercase letters/digits"
-    return room, None
+        return "", f"invalid room token {room!r}: expected 4-32 lowercase letters/digits", None
+    if current and room != current:
+        return room, None, f"Acting on room {room}, not this chat ({current}), as requested."
+    return room, None, None
+
+
+def _with_note(data: dict, note: Optional[str]) -> dict:
+    if note:
+        data["room_note"] = note
+    return data
 
 
 def unit_for(room: str) -> str:
@@ -164,7 +189,7 @@ def _truthy(v: Any) -> bool:
 
 # ----------------------------------------------------------------- handlers
 def call_join(args: dict, **_kw: Any) -> str:
-    room, err = _resolve_room(args)
+    room, err, note = _resolve_room(args)
     if err:
         return _result(error=err)
     unit = unit_for(room)
@@ -172,8 +197,9 @@ def call_join(args: dict, **_kw: Any) -> str:
     if state.get("LoadState") == "not-found":
         return _result(error=f"{unit} is not installed on this host (skcall systemd template missing)")
     if _in_call(state):
-        return _result(status="already in call", room=room, unit=unit,
-                       note="She is already in this call. Do not start another one.")
+        return _result(**_with_note({"status": "already in call", "room": room, "unit": unit,
+                                     "note": "You are already in this call. Do not start another one."},
+                                    note))
     try:
         write_env_file(room, _truthy((args or {}).get("ring")), clean_greeting((args or {}).get("greeting")))
     except OSError as e:
@@ -181,14 +207,15 @@ def call_join(args: dict, **_kw: Any) -> str:
     p = _systemctl("start", "--no-block", unit)
     if p.returncode != 0:
         return _result(error=f"systemctl start {unit} failed: {(p.stderr or p.stdout or '').strip()[:300]}")
-    return _result(status="joining", room=room, unit=unit,
-                   note=("Joining now in the background; it takes a few seconds. Do not run it "
-                         "again, do not poll, and do not start skcall any other way. A summary "
-                         "is posted to the room's chat when the call ends."))
+    return _result(**_with_note({"status": "joining", "room": room, "unit": unit,
+                                 "note": ("Joining now in the background; it takes a few seconds. Do not "
+                                          "run it again, do not poll, and do not start skcall any other "
+                                          "way. A summary is posted to the room's chat when the call ends.")},
+                                note))
 
 
 def call_leave(args: dict, **_kw: Any) -> str:
-    room, err = _resolve_room(args)
+    room, err, note = _resolve_room(args)
     if err:
         return _result(error=err)
     unit = unit_for(room)
@@ -198,11 +225,11 @@ def call_leave(args: dict, **_kw: Any) -> str:
     except (FileNotFoundError, OSError):
         pass
     if not _in_call(state):
-        return _result(status="not in call", room=room, unit=unit)
+        return _result(**_with_note({"status": "not in call", "room": room, "unit": unit}, note))
     p = _systemctl("stop", "--no-block", unit)
     if p.returncode != 0:
         return _result(error=f"systemctl stop {unit} failed: {(p.stderr or p.stdout or '').strip()[:300]}")
-    return _result(status="leaving", room=room, unit=unit)
+    return _result(**_with_note({"status": "leaving", "room": room, "unit": unit}, note))
 
 
 def _describe(room: str, state: dict) -> dict:
@@ -228,11 +255,11 @@ def _describe(room: str, state: dict) -> dict:
 
 
 def call_status(args: dict, **_kw: Any) -> str:
-    room = str((args or {}).get("room") or "").strip() or current_room()
-    if room:
-        if not ROOM_RE.fullmatch(room):
-            return _result(error=f"invalid room token {room!r}: expected 4-32 lowercase letters/digits")
-        return _result(**_describe(room, unit_state(room)))
+    if str((args or {}).get("room") or "").strip() or current_room():
+        room, err, note = _resolve_room(args)
+        if err:
+            return _result(error=err)
+        return _result(**_with_note(_describe(room, unit_state(room)), note))
     p = _systemctl("list-units", "--all", "--no-legend", "--plain", "skcall-join@*.service")
     calls = []
     for line in (p.stdout or "").splitlines():
@@ -247,8 +274,22 @@ def call_status(args: dict, **_kw: Any) -> str:
 
 # ----------------------------------------------------------------- schemas
 _COMMON = (" Use these call tools for ANY request to join, leave or check a call "
-           "(e.g. '@lumina join call'). Never launch skcall, python or systemd-run "
+           "(e.g. '@agent join call'). Never launch skcall, python or systemd-run "
            "through the terminal tool, and never run a call as a background process.")
+
+_ROOM_HINT = (" From a Talk chat, leave room EMPTY: it means this chat, which is what "
+              "'join the call' asks for. Never fill room from a home channel, a channel "
+              "list or memory.")
+
+_ROOM_PROP = {"type": "string",
+              "description": ("Talk room token (4-32 lowercase letters/digits). Leave empty to mean "
+                              "the current Talk chat (the normal case). Only set it for a different "
+                              "room the user explicitly named, and then also set other_room=true; "
+                              "without it, a different room is ignored and this chat is used.")}
+
+_OTHER_ROOM_PROP = {"type": "boolean", "default": False,
+                    "description": ("true only when the user explicitly asked to act on a "
+                                    "different Talk room than this chat. Default false.")}
 
 CALL_JOIN_SCHEMA = {
     "name": "call_join",
@@ -256,14 +297,13 @@ CALL_JOIN_SCHEMA = {
         "Join the Nextcloud Talk call of a room as yourself (voice, with your avatar). "
         "Returns immediately with 'joining' or 'already in call'; the call then runs on "
         "its own in the background, exactly one instance per room. Call it ONCE per "
-        "request: do not retry, poll or relaunch it, and never start a second join. "
-        "When invoked from a Talk chat, room defaults to that chat's room." + _COMMON),
+        "request: do not retry, poll or relaunch it, and never start a second join."
+        + _ROOM_HINT + _COMMON),
     "parameters": {
         "type": "object",
         "properties": {
-            "room": {"type": "string",
-                     "description": "Talk room token (4-32 lowercase letters/digits). "
-                                    "Omit to use the current Talk chat's room."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
             "ring": {"type": "boolean", "default": False,
                      "description": "Ring the room's members (non-silent join). Default false: "
                                     "only ring when explicitly asked."},
@@ -276,13 +316,10 @@ CALL_JOIN_SCHEMA = {
 CALL_LEAVE_SCHEMA = {
     "name": "call_leave",
     "description": ("Leave the Nextcloud Talk call of a room (clean leave; a summary is "
-                    "posted to the room's chat). Room defaults to the current Talk chat." + _COMMON),
+                    "posted to the room's chat)." + _ROOM_HINT + _COMMON),
     "parameters": {
         "type": "object",
-        "properties": {
-            "room": {"type": "string",
-                     "description": "Talk room token. Omit to use the current Talk chat's room."},
-        },
+        "properties": {"room": _ROOM_PROP, OVERRIDE_ARG: _OTHER_ROOM_PROP},
     },
 }
 
@@ -290,12 +327,10 @@ CALL_STATUS_SCHEMA = {
     "name": "call_status",
     "description": ("Check whether you are in a Nextcloud Talk call: for one room (default the "
                     "current Talk chat) or, with no room outside Talk, every call unit on this "
-                    "host. Shows the last failure reason if a join failed." + _COMMON),
+                    "host. Shows the last failure reason if a join failed." + _ROOM_HINT + _COMMON),
     "parameters": {
         "type": "object",
-        "properties": {
-            "room": {"type": "string", "description": "Talk room token (optional)."},
-        },
+        "properties": {"room": _ROOM_PROP, OVERRIDE_ARG: _OTHER_ROOM_PROP},
     },
 }
 
