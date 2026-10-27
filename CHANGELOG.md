@@ -4,6 +4,25 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.9.1] - 2026-10-27
+
+### Changed
+
+- A `free` group room (listed in `NEXTCLOUD_TALK_ROOM_MODES`, not a DM or a
+  private two-person room) now treats the agent as the room's Chief of Staff
+  instead of "every line is for me". A human message that does not mention
+  this account but @mentions another participant (rich mention of a user,
+  guest, federated user or group, or a plain `@<agent>` from
+  `NEXTCLOUD_TALK_AGENT_USERS`) is kept as context only, so "@jarvis do X"
+  no longer forces Lumina to answer. Any other unaddressed human message is
+  delivered with `reply_expected=False`, so the agent can stay quiet on
+  human-to-human chatter without the core posting its "model returned only a
+  silence marker" warning into the room (seen four times in Operators AI,
+  2026-10-24/25). Messages that mention this account still expect a reply;
+  DMs, private pair rooms and `mention`/`watch` rooms are unchanged.
+- The Talk channel prompt says so: answer unaddressed questions meant for the
+  team, stay silent on human-to-human chatter.
+
 ## [1.9.0] - 2026-10-27
 
 ### Added

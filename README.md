@@ -185,6 +185,20 @@ session and posts replies with `threadId`; bots cannot open threads here.
 Without the `threads` capability (or if the capability read fails) nothing of
 this applies and the adapter behaves exactly like 1.8.4.
 
+### Free rooms: Chief of Staff (user mode)
+
+In a `free` group room (listed in `NEXTCLOUD_TALK_ROOM_MODES`; DMs and
+private two-person rooms are not affected) the agent acts as the room's
+Chief of Staff:
+
+- a human message that @mentions this account expects a reply;
+- a human message that @mentions someone else and not this account (a user,
+  guest, federated user or group, or a plain `@<agent>` from
+  `NEXTCLOUD_TALK_AGENT_USERS`) is kept as context only, no turn;
+- any other human message reaches the agent with `reply_expected=False`: it
+  answers questions meant for the team and may stay silent on chatter between
+  people, without Hermes posting its silence-marker warning.
+
 ### Active listening (user mode)
 
 A message this account does not answer -- an un-mentioned message in a
