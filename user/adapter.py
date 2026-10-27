@@ -249,7 +249,10 @@ THREADS_HINT = (
     "an answer to a message in a thread goes into that thread on its own. When a "
     "task finishes, post a one-line result in the main timeline if the room would "
     "want to know. A thread another agent started is that agent's work: do not "
-    "speak in it unless you are @mentioned there."
+    "speak in it unless you are @mentioned there. In a group room where you "
+    "answer without being @mentioned (you are its Chief of Staff), answer "
+    "unaddressed questions meant for the team and stay silent on human-to-human "
+    "chatter; a message @mentioning someone else never reaches you as a turn."
 )
 THREAD_OWNERSHIP_ENV = "NEXTCLOUD_TALK_THREAD_OWNERSHIP"
 HOME_THREAD_ENV = "NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID"
@@ -690,6 +693,44 @@ def _is_mention(
         rf"@{re.escape(own_display_name)}\b", text, re.IGNORECASE
     ):
         return True
+    return False
+
+
+# Rich mention types that address someone (a person, guest, group or team);
+# "call" (@all) addresses everyone, this account included, so it does not count.
+_OTHER_MENTION_TYPES = frozenset({"user", "guest", "federated_user", "user-group", "group", "circle"})
+
+
+def _mentions_someone_else(
+    text: str,
+    message_parameters: Optional[Dict[str, Any]],
+    own_user_id: str,
+    own_display_name: str,
+    agent_users: frozenset,
+) -> bool:
+    """True if a message @mentions a participant other than this account.
+
+    Rich ``messageParameters`` mentions count (outside code, like
+    ``_is_mention``), plus a plain-text ``@<agent>`` for any other agent in
+    ``agent_users``.
+    """
+    text = text or ""
+    visible = _RE_CODE.sub(" ", text)
+    own = (own_user_id or "").casefold()
+    for key, param in (message_parameters or {}).items():
+        if not isinstance(param, dict) or param.get("type") not in _OTHER_MENTION_TYPES:
+            continue
+        pid = str(param.get("id") or "").casefold()
+        if not pid or pid == own or pid.split("@", 1)[0] == own:
+            continue
+        placeholder = "{" + str(key) + "}"
+        if placeholder in text and placeholder not in visible:
+            continue  # only quoted inside code
+        return True
+    for agent in agent_users:
+        name = agent.split("@", 1)[0]
+        if name and name != own and re.search(rf"(?<![\w.])@{re.escape(name)}\b", visible, re.IGNORECASE):
+            return True
     return False
 
 
@@ -1288,6 +1329,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             mode = self._dm_mode
         else:
             mode = _room_mode(token, display_name, self._room_modes)
+        # A listed "free" group room (not a DM or private pair): the agent is
+        # the room's Chief of Staff and human chatter is not all addressed to it.
+        chief_room = (mode == ROOM_MODE_FREE and chat_type != "dm" and not self._is_pair_room(token))
 
         thread = await self._thread_info(token, thread_id) if thread_id else None
         if thread is not None and self._thread_ownership and chat_type != "dm":
@@ -1367,6 +1411,18 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # deliberate silence marker as a failure and posted its
             # "model returned only a silence marker" warning into the room
             # (Operators AI, 2026-10-25). A human's mention still expects a reply.
+            event.reply_expected = False
+        elif chief_room and not mentioned and not is_command:
+            if _mentions_someone_else(text, message.get("messageParameters"), self._username,
+                                      self._display_name, self._agent_users):
+                # "@jarvis do X" from a human is for Jarvis, not for us: keep
+                # it as context, take no turn.
+                self._remember(token, actor, text, msg_id, thread_id=thread_id)
+                return
+            # Unaddressed: may be for the team, may be human-to-human chatter.
+            # The agent decides; staying silent must not post the core's
+            # "model returned only a silence marker" warning (Operators AI,
+            # four times 2026-10-24/25).
             event.reply_expected = False
 
         if shared_files:
