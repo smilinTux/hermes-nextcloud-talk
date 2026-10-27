@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.9.2] - 2026-10-27
+
+### Fixed
+
+- Thread detection in user mode. Talk puts `threadId` on every chat message
+  (`topmostParentId ?: id`, spreed `Message::toArray`), thread or not, and
+  1.9.0 took that field alone as "in a thread". On the live skhubs every
+  main-timeline message became its own one-message "thread" session, and a
+  follow-up chunk would have posted with the `threadId` of a message that is
+  not a thread. Only `isThread` marks a real thread (the root and every reply
+  carry it with `threadTitle`; `threadId` is then the root's id). Tests now
+  use the payload shape captured from Talk 24.0.6.
+
 ## [1.9.1] - 2026-10-27
 
 ### Changed
