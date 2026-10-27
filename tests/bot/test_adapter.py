@@ -801,3 +801,45 @@ async def test_bot_channel_prompt_unchanged_when_call_tools_off(monkeypatch):
         await _post_webhook(c, create_payload(message="hi", msg_id="1"))
         await asyncio.sleep(0)
     assert adapter.handled_events[0].channel_prompt == bot_adapter._PLATFORM_HINT
+
+
+# -- v1.9.0: threads ----------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_webhook_thread_message_gets_its_own_session(client):
+    c, adapter = client
+    payload = create_payload(message="@Jarvis in a thread", msg_id="7")
+    payload["object"]["threadId"] = 5
+    await _post_webhook(c, payload)
+    await _post_webhook(c, create_payload(message="@Jarvis top level", msg_id="8"))
+    await asyncio.sleep(0)
+    assert [e.source.thread_id for e in adapter.handled_events] == ["5", None]
+
+
+@pytest.mark.asyncio
+async def test_send_in_thread_puts_thread_id_on_every_chunk():
+    calls = []
+
+    async def fake_handler(request):
+        calls.append(json.loads(await request.read()))
+        return web.json_response({"ocs": {"meta": {"status": "ok"}}})
+
+    app = web.Application()
+    app.router.add_post("/ocs/v2.php/apps/spreed/api/v1/bot/{token}/message", fake_handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        adapter = NextcloudTalkAdapter(make_config(base_url=str(server.make_url("")).rstrip("/")))
+        from aiohttp import ClientSession
+
+        adapter._http = ClientSession()
+        result = await adapter.send("room1", "x" * 40000, reply_to="7", metadata={"thread_id": "5"})
+        assert result.success is True
+        assert len(calls) == 2 and all(b["threadId"] == 5 for b in calls)
+        assert calls[0]["replyTo"] == 7 and "replyTo" not in calls[1]
+        calls.clear()
+        await adapter.send("room1", "plain")
+        assert "threadId" not in calls[0]
+        await adapter._http.close()
+    finally:
+        await server.close()

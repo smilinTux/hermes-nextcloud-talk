@@ -63,6 +63,9 @@ class ParsedMessage:
     message_id: str
     text: str = ""
     parameters: Dict[str, Any] = field(default_factory=dict)
+    # Talk 22.0.10+: ``object.threadId`` when the message is in a thread
+    # (the thread id is the root message id). None for the main timeline.
+    thread_id: Optional[str] = None
 
 
 def parse_webhook_body(data: Dict[str, Any]) -> Optional[ParsedMessage]:
@@ -106,7 +109,17 @@ def parse_webhook_body(data: Dict[str, Any]) -> Optional[ParsedMessage]:
         message_id=str(target.get("id") or ""),
         text=text,
         parameters=parameters,
+        thread_id=_thread_id(target.get("threadId")),
     )
+
+
+def _thread_id(raw: Any) -> Optional[str]:
+    """A positive thread id as a string; 0, missing or junk means no thread."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return str(value) if value > 0 else None
 
 
 def resolve_mentions(text: str, parameters: Dict[str, Any]) -> str:

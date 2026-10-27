@@ -137,6 +137,6 @@ def register(ctx) -> None:
             "You are chatting via Nextcloud Talk. Markdown is supported. "
             "Messages over 32000 characters are split automatically. In a "
             "'watch' mode room (bot mode only) with nothing worth adding, "
-            "reply with exactly NO_REPLY and nothing else."
+            "reply with exactly NO_REPLY and nothing else. " + _user.THREADS_HINT
         ),
     )

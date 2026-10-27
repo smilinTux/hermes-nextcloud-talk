@@ -4,6 +4,47 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.9.0] - 2026-10-27
+
+### Added
+
+- Nextcloud Talk threads (Talk 22+, capability `threads`, present on both
+  skhubs running Talk 24.0.6). User mode reads each message's `threadId`
+  (a thread root's own id when `isThread`) and passes it to Hermes as the
+  session's `thread_id`, so every thread is its own session. The context
+  backlog and the agent-chain counter are kept per room and thread: thread
+  replies never ride into a main-timeline reply and the reverse, and a
+  thread's first turn is told the thread title and root message.
+- Replies stay in the thread: every chunk carries `threadId` (only the first
+  has `replyTo`, so chunks 2+ used to land in the main timeline), file and
+  voice shares put `threadId` in `talkMetaData`, the federated link fallback
+  posts into the thread, and the standalone sender (cron, `send_message`)
+  honours `thread_id`. `NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID` is now seeded
+  into the home channel, so cron delivery can post into a thread.
+- Thread ownership for multi-agent rooms, `NEXTCLOUD_TALK_THREAD_OWNERSHIP`
+  (default `on`): a thread started by another agent from
+  `NEXTCLOUD_TALK_AGENT_USERS` only gets an answer when this account is
+  @mentioned there, whatever the room mode; a thread this account started
+  answers its people without an @mention. The creator comes from the root
+  message or, for older threads, `GET /chat/{token}/threads/{id}` (cached).
+- `talk_thread_start(title, message, room?)` and
+  `talk_thread_reply(message, thread_id?, room?)` tools (toolset
+  `nctalk-threads`, on with user-mode credentials,
+  `NEXTCLOUD_TALK_THREAD_TOOLS=off` hides them), pinned visible past
+  tool_search like the call tools.
+- Bot mode parses `object.threadId` from the webhook into the session and
+  posts replies with `threadId` on every chunk.
+
+### Changed
+
+- The Talk channel prompt explains threads (top level for requests, task work
+  in a thread, reply where addressed, one-line result at top level, stay out
+  of other agents' threads unless @mentioned) instead of claiming there are
+  no threads.
+- Threads are capability gated: if the server does not list `threads`, or the
+  capabilities read fails, the adapter behaves exactly like 1.8.4.
+- README install line copies `tools.py` too (the call tools need it).
+
 ## [1.8.4] - 2026-10-26
 
 ### Added

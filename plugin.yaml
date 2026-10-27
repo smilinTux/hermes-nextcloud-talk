@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.8.4
+version: 1.9.0
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -11,11 +11,15 @@ description: >
   for user mode, both already Hermes dependencies.
 author: "Hermes Nextcloud Talk contributors"
 # Opt-in call tools (tools.py, toolset nctalk-calls), active only with
-# NEXTCLOUD_TALK_CALL_TOOLS=on. Declared so CLI/TUI processes register them too.
+# NEXTCLOUD_TALK_CALL_TOOLS=on, and thread tools (toolset nctalk-threads), on in
+# user mode unless NEXTCLOUD_TALK_THREAD_TOOLS=off. Declared so CLI/TUI
+# processes register them too.
 provides_tools:
   - call_join
   - call_leave
   - call_status
+  - talk_thread_start
+  - talk_thread_reply
 requires_env: []
 optional_env:
   # -- Bot mode --
@@ -114,6 +118,13 @@ optional_env:
     description: "Human label for the home channel"
     prompt: "Home channel display name (or empty)"
     password: false
+  - name: NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID
+    description: >-
+      Optional thread id (the thread's root message id) inside the home
+      channel; cron / notification delivery then posts into that Talk thread
+      (Talk 22+)
+    prompt: "Home channel thread id (or empty)"
+    password: false
   - name: NEXTCLOUD_TALK_WORKING_REACTION
     description: >-
       Reaction added to a message while a turn is being processed and
@@ -137,6 +148,21 @@ optional_env:
       as context with the next message this account does answer
       (default 40; 0 disables active listening).
     prompt: "Context backlog size (user mode, default 40, 0 disables)"
+    password: false
+  - name: NEXTCLOUD_TALK_THREAD_OWNERSHIP
+    description: >-
+      User mode: 'on' (default) treats a Talk thread started by another agent
+      (NEXTCLOUD_TALK_AGENT_USERS) as that agent's, so this account only
+      answers there when @mentioned, whatever the room mode; a thread this
+      account started answers its people without an @mention. 'off' makes
+      every thread follow the room mode.
+    prompt: "Thread ownership (user mode, on/off, default on)"
+    password: false
+  - name: NEXTCLOUD_TALK_THREAD_TOOLS
+    description: >-
+      User mode: 'off' hides the talk_thread_start / talk_thread_reply tools
+      (default on when the user-mode credentials are set)
+    prompt: "Thread tools (user mode, on/off, default on)"
     password: false
   # -- Call tools (opt-in) --
   - name: NEXTCLOUD_TALK_CALL_TOOLS
