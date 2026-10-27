@@ -56,12 +56,19 @@ def _msg(msg_id, actor_id, text, *, thread=None, root=False, title=None, params=
         "messageParameters": params or {},
         "timestamp": 1700000000,
     }
+    # Real Talk shape (spreed Message::toArray): threadId is on EVERY message
+    # (topmost parent or own id); isThread + threadTitle mark a real thread,
+    # on the root and on every reply.
     if root:
         m["isThread"] = True
         m["threadId"] = int(msg_id)
         m["threadTitle"] = title or "task"
     elif thread is not None:
+        m["isThread"] = True
         m["threadId"] = int(thread)
+        m["threadTitle"] = title or "task"
+    else:
+        m["threadId"] = int(msg_id)
     return m
 
 
@@ -92,11 +99,12 @@ def _recording_client(adapter, responder=None):
 
 @pytest.mark.parametrize("message,expected", [
     ({"id": 5}, None),
-    ({"id": 5, "threadId": 0}, None),
-    ({"id": 5, "threadId": None}, None),
-    ({"id": 5, "threadId": "junk"}, None),
-    ({"id": 9, "threadId": 5}, "5"),
-    ({"id": 5, "isThread": True, "threadId": 5}, "5"),
+    ({"id": 5, "threadId": 5}, None),            # plain message: Talk sets threadId = own id
+    ({"id": 9, "threadId": 5, "parent": {"id": 5}}, None),  # quote reply, no thread
+    ({"id": 5, "isThread": True, "threadId": 0}, "5"),
+    ({"id": 5, "isThread": True, "threadId": "junk"}, None),
+    ({"id": 9, "isThread": True, "threadId": 5}, "5"),       # reply in thread 5
+    ({"id": 5, "isThread": True, "threadId": 5}, "5"),       # root
     ({"id": 5, "isThread": True}, "5"),
 ])
 def test_message_thread_id(message, expected):
@@ -139,6 +147,27 @@ def test_thread_root_is_routed_into_its_own_thread():
     event = adapter.handled_events[0]
     assert event.source.thread_id == "30"
     assert 'Talk thread "Do X"' in event.text
+
+
+def test_live_shape_main_timeline_and_quote_replies_are_not_threads():
+    # Captured from skhub (Talk 24.0.6): every message carries threadId.
+    adapter = _adapter(room_modes="tok1=free")
+    _room(adapter)
+    plain = {"id": 11566, "threadId": 11566, "actorId": "alice", "actorType": "users",
+             "actorDisplayName": "alice", "message": "hi", "messageType": "comment",
+             "messageParameters": {}, "timestamp": 1}
+    quote = dict(plain, id=11570, threadId=11567, message="re", parent={"id": 11567})
+    _run(adapter._on_message("tok1", plain))
+    _run(adapter._on_message("tok1", quote))
+    assert [e.source.thread_id for e in adapter.handled_events] == [None, None]
+    assert adapter._threads == {}
+
+
+def test_reply_title_fills_in_thread_title():
+    adapter = _adapter(room_modes="tok1=free")
+    _room(adapter)
+    _run(adapter._on_message("tok1", _msg(11, "alice", "go", thread=10, title="Fix CI")))
+    assert 'Talk thread "Fix CI"' in adapter.handled_events[0].text
 
 
 def test_capability_absent_ignores_thread_fields():

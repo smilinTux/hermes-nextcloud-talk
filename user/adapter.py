@@ -428,10 +428,15 @@ def _with_room_rules(text: str, description: Optional[str]) -> str:
 def _message_thread_id(message: Dict[str, Any]) -> Optional[str]:
     """Thread id of a Talk chat message as a string, or None for the main timeline.
 
-    A thread root carries ``isThread`` and its own id is the thread id; a
-    reply carries ``threadId``. 0, missing or junk means "not in a thread".
+    Talk puts ``threadId`` on EVERY message (``topmostParentId ?: id``, see
+    spreed ``Message::toArray``), thread or not, so ``threadId`` alone means
+    nothing. Only ``isThread`` says the message belongs to a real thread: the
+    root and every reply carry it (with ``threadTitle``), and ``threadId`` is
+    then the root's id. Missing ``isThread``, or a junk id, is the main timeline.
     """
-    raw = message.get("id") if message.get("isThread") else message.get("threadId")
+    if not message.get("isThread"):
+        return None
+    raw = message.get("threadId") or message.get("id")
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -1311,7 +1316,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
 
         actor = _extract_actor(message)
         thread_id = _message_thread_id(message) if self._threads_enabled else None
-        if thread_id and message.get("isThread"):
+        if thread_id and thread_id == msg_id:
             # A thread root (ours included): remember who opened it and how.
             self._note_thread_root(token, thread_id, message, actor)
         if self._is_self(actor):
@@ -1443,7 +1448,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if thread is not None and key not in self._thread_root_given:
             # First turn of this thread's session: say what the thread is.
             self._thread_root_given.add(key)
-            root = thread.get("root") if not message.get("isThread") else None
+            root = thread.get("root") if thread_id != msg_id else None
+            if not thread.get("title") and message.get("threadTitle"):
+                thread["title"] = message.get("threadTitle")
             event.text = _with_thread_root(event.text, thread.get("title"), root)
         if chat_type != "dm" and (self._room_rules_all or token in self._room_modes):
             # Whoever creates a room writes its description; only rooms the
