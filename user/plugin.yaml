@@ -93,3 +93,14 @@ optional_env:
       disables active listening).
     prompt: "Context backlog size (default 40, 0 disables)"
     password: false
+  - name: NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID
+    description: "Optional thread id (root message id) in the home channel for cron delivery (Talk 22+)"
+    prompt: "Home channel thread id (or empty)"
+    password: false
+  - name: NEXTCLOUD_TALK_THREAD_OWNERSHIP
+    description: >-
+      'on' (default): a thread started by another agent in
+      NEXTCLOUD_TALK_AGENT_USERS is answered only when @mentioned; 'off'
+      makes every thread follow the room mode.
+    prompt: "Thread ownership (on/off, default on)"
+    password: false

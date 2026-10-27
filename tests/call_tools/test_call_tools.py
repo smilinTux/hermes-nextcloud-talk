@@ -191,15 +191,21 @@ def test_register_tools_gated():
         def register_tool(self, **kw):
             seen.append(kw)
     ct.register_tools(Ctx())
-    assert [k["name"] for k in seen] == ["call_join", "call_leave", "call_status"]
-    assert all(k["toolset"] == "nctalk-calls" and k["check_fn"] is ct.tools_enabled for k in seen)
-    for k in seen:
+    calls = [k for k in seen if k["toolset"] == "nctalk-calls"]
+    threads = [k for k in seen if k["toolset"] == "nctalk-threads"]
+    assert [k["name"] for k in calls] == ["call_join", "call_leave", "call_status"]
+    assert [k["name"] for k in threads] == ["talk_thread_start", "talk_thread_reply"]
+    assert len(seen) == 5
+    assert all(k["check_fn"] is ct.tools_enabled for k in calls)
+    assert all(k["check_fn"] is ct.thread_tools_enabled for k in threads)
+    for k in calls:
         assert "never launch skcall" in k["description"].lower()
+    for k in seen:
         assert k["schema"]["name"] == k["name"]
 
 
 def test_descriptions_have_no_long_dashes():
-    for _, schema, _, _ in ct.TOOLS:
+    for _, schema, _, _ in ct.TOOLS + ct.THREAD_TOOLS:
         assert "\u2014" not in json.dumps(schema, ensure_ascii=False)
         assert "\u2013" not in json.dumps(schema, ensure_ascii=False)
 
@@ -219,7 +225,8 @@ def _fake_tool_search(monkeypatch, direct=frozenset({"project", "desktop_ui"})):
 def test_pin_visible_adds_toolset_to_direct_surface(monkeypatch):
     mod = _fake_tool_search(monkeypatch)
     assert ct.pin_visible() is True
-    assert mod._DIRECT_SURFACE_TOOLSETS == frozenset({"project", "desktop_ui", "nctalk-calls"})
+    assert mod._DIRECT_SURFACE_TOOLSETS == frozenset(
+        {"project", "desktop_ui", "nctalk-calls", "nctalk-threads"})
     assert isinstance(mod._DIRECT_SURFACE_TOOLSETS, frozenset)
 
 

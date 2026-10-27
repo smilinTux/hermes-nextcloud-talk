@@ -21,6 +21,12 @@ call natively on the host: ``m4jyfpxq:nam:og63pxfh`` makes "@lumina join call"
 in nor's federated Operators AI (m4jyfpxq) start
 ``skcall-join-nam@og63pxfh.service`` (skcall's ``systemd/skcall-join-nam@.service``).
 
+Thread tools (toolset ``nctalk-threads``, on by default in user mode, off with
+``NEXTCLOUD_TALK_THREAD_TOOLS=off``): ``talk_thread_start`` opens a Talk
+thread (Talk 22+, capability ``threads``) with a title and a first message and
+returns its id; ``talk_thread_reply`` posts into an existing thread. They post
+as the agent's own Nextcloud account (user mode credentials), never a bot.
+
 Kept import-light (stdlib only, no gateway imports at module level) so the
 Hermes loader can pre-register these tools in CLI/TUI processes.
 """
@@ -408,8 +414,9 @@ def pin_visible() -> bool:
         import importlib
         ts = importlib.import_module(_TOOL_SEARCH_MODULE)
         current = getattr(ts, _DIRECT_ATTR)
-        if TOOLSET not in current:
-            setattr(ts, _DIRECT_ATTR, frozenset(current) | {TOOLSET})
+        wanted = {TOOLSET, THREAD_TOOLSET}
+        if not wanted <= set(current):
+            setattr(ts, _DIRECT_ATTR, frozenset(current) | wanted)
         return True
     except Exception:
         import logging
@@ -419,10 +426,193 @@ def pin_visible() -> bool:
         return False
 
 
+# ----------------------------------------------------------------- threads
+_THREAD_ROOM_HINT = (" From a Talk chat, leave room EMPTY: it means this chat. Never fill room "
+                     "from a home channel, a channel list or memory.")
+THREAD_TOOLSET = "nctalk-threads"
+THREAD_ENABLE_ENV = "NEXTCLOUD_TALK_THREAD_TOOLS"
+THREAD_TITLE_MAX = 200
+THREAD_MESSAGE_MAX = 32000
+CAPS_TTL_SECONDS = 600.0
+_CHAT_PATH = "/ocs/v2.php/apps/spreed/api/v1/chat/{room}"
+
+# (server, checked at, has threads); swappable in tests together with _http_post/_http_get.
+_caps_cache: dict = {}
+
+
+def _talk_credentials() -> tuple[str, str, str]:
+    server = _env("NEXTCLOUD_TALK_SERVER_URL", "").strip().rstrip("/")
+    user = _env("NEXTCLOUD_TALK_USERNAME", "hermes-bot").strip()
+    password = _env("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
+    return server, user, password
+
+
+def thread_tools_enabled() -> bool:
+    """On when user-mode credentials exist, unless NEXTCLOUD_TALK_THREAD_TOOLS=off."""
+    if _env(THREAD_ENABLE_ENV, "on").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    server, _user, password = _talk_credentials()
+    return bool(server and password)
+
+
+def _ocs(method: str, path: str, *, json_body: Optional[dict] = None) -> tuple[int, Any]:
+    """One OCS request as the agent's account: (status, parsed ocs.data or text)."""
+    import httpx  # Hermes dependency; imported lazily to keep this module stdlib-only at import
+
+    server, user, password = _talk_credentials()
+    headers = {"OCS-APIRequest": "true", "Accept": "application/json"}
+    with httpx.Client(base_url=server, auth=(user, password), headers=headers, timeout=20.0) as client:
+        resp = client.request(method, path, params={"format": "json"}, json=json_body)
+    try:
+        data = resp.json().get("ocs", {}).get("data")
+    except Exception:
+        data = resp.text[:300]
+    return resp.status_code, data
+
+
+_request = _ocs  # swappable in tests
+
+
+def server_has_threads() -> bool:
+    import time
+
+    server = _talk_credentials()[0]
+    cached = _caps_cache.get(server)
+    if cached and time.time() - cached[0] < CAPS_TTL_SECONDS:
+        return cached[1]
+    status, data = _request("GET", "/ocs/v2.php/cloud/capabilities")
+    if status >= 300 or not isinstance(data, dict):
+        return False  # not cached: retried on the next call
+    features = ((data.get("capabilities") or {}).get("spreed") or {}).get("features") or []
+    has = "threads" in features
+    _caps_cache[server] = (time.time(), has)
+    return has
+
+
+def current_thread() -> str:
+    """The Talk thread this turn came from, or "" (main timeline / not Talk)."""
+    if not current_room():
+        return ""
+    tid = _session("HERMES_SESSION_THREAD_ID").strip()
+    return tid if tid.isdigit() and int(tid) > 0 else ""
+
+
+def _one_line(text: Any, limit: int) -> str:
+    return " ".join(str(text or "").split())[:limit]
+
+
+def _post_chat(room: str, body: dict) -> tuple[Optional[str], Optional[str]]:
+    """(message id, error) for a chat POST."""
+    try:
+        status, data = _request("POST", _CHAT_PATH.format(room=room), json_body=body)
+    except Exception as e:
+        return None, f"post failed: {e}"
+    if status >= 300:
+        return None, f"HTTP {status}: {str(data)[:300]}"
+    mid = data.get("id") if isinstance(data, dict) else None
+    return (str(mid) if mid else None), None
+
+
+def talk_thread_start(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    title = _one_line(args.get("title"), THREAD_TITLE_MAX)
+    message = str(args.get("message") or "").strip()[:THREAD_MESSAGE_MAX]
+    if not title:
+        return _result(error="title is required: Talk refuses a thread without a title")
+    if not message:
+        return _result(error="message is required: it becomes the thread's first message")
+    room, err, note = _resolve_room(args)
+    if err:
+        return _result(error=err)
+    if not server_has_threads():
+        return _result(error="this Nextcloud Talk server does not support threads (needs Talk 22+)")
+    mid, err = _post_chat(room, {"message": message, "threadTitle": title})
+    if err:
+        return _result(error=f"could not start the thread: {err}")
+    out = {"status": "created", "room": room, "title": title, "thread_id": mid,
+           "note": ("Thread started. Post follow-ups into it with talk_thread_reply(thread_id). "
+                    "Replies people make in it reach you as that thread's own conversation.")}
+    if not mid:
+        out["note"] = "Posted, but the server did not return the new message id, so the thread id is unknown."
+    return _result(**_with_note(out, note))
+
+
+def talk_thread_reply(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    message = str(args.get("message") or "").strip()[:THREAD_MESSAGE_MAX]
+    if not message:
+        return _result(error="message is required")
+    room, err, note = _resolve_room(args)
+    if err:
+        return _result(error=err)
+    explicit = str(args.get("thread_id") or "").strip()
+    thread = explicit or (current_thread() if room == current_room() else "")
+    if not thread.isdigit() or int(thread) <= 0:
+        return _result(error="thread_id is required: the id talk_thread_start returned (a message id)")
+    if not server_has_threads():
+        return _result(error="this Nextcloud Talk server does not support threads (needs Talk 22+)")
+    mid, err = _post_chat(room, {"message": message, "threadId": int(thread)})
+    if err:
+        return _result(error=f"could not post into thread {thread}: {err}")
+    return _result(**_with_note({"status": "posted", "room": room, "thread_id": thread,
+                                 "message_id": mid}, note))
+
+
+TALK_THREAD_START_SCHEMA = {
+    "name": "talk_thread_start",
+    "description": (
+        "Open a new Nextcloud Talk thread in a group room: a titled side conversation "
+        "for one task, so the work does not fill the main timeline. Posts the first "
+        "message as you and returns thread_id. Use it when you take on a task asked in "
+        "the main timeline; inside an existing thread just reply normally." + _THREAD_ROOM_HINT),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string",
+                      "description": "Short thread title naming the task (required, one line)."},
+            "message": {"type": "string", "description": "The thread's first message (required)."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
+        },
+        "required": ["title", "message"],
+    },
+}
+
+TALK_THREAD_REPLY_SCHEMA = {
+    "name": "talk_thread_reply",
+    "description": (
+        "Post a message into an existing Nextcloud Talk thread, e.g. one you opened with "
+        "talk_thread_start. Not needed to answer the message you are replying to: that "
+        "answer already goes to the right place." + _THREAD_ROOM_HINT),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "thread_id": {"type": "string",
+                          "description": ("Thread id (the thread's first message id, as returned by "
+                                          "talk_thread_start). Empty means the thread this chat "
+                                          "turn came from.")},
+            "message": {"type": "string", "description": "Message text (required)."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
+        },
+        "required": ["message"],
+    },
+}
+
+THREAD_TOOLS = (
+    ("talk_thread_start", TALK_THREAD_START_SCHEMA, talk_thread_start, "🧵"),  # thread
+    ("talk_thread_reply", TALK_THREAD_REPLY_SCHEMA, talk_thread_reply, "💬"),  # speech balloon
+)
+
+
 def register_tools(ctx) -> None:
-    """Register the call tools in the ``nctalk-calls`` toolset, gated on NEXTCLOUD_TALK_CALL_TOOLS."""
+    """Register the call tools (``nctalk-calls``, gated on NEXTCLOUD_TALK_CALL_TOOLS) and the
+    thread tools (``nctalk-threads``, on in user mode unless NEXTCLOUD_TALK_THREAD_TOOLS=off)."""
     for name, schema, handler, emoji in TOOLS:
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji, check_fn=tools_enabled)
+    for name, schema, handler, emoji in THREAD_TOOLS:
+        ctx.register_tool(name=name, toolset=THREAD_TOOLSET, schema=schema, handler=handler,
+                          description=schema["description"], emoji=emoji, check_fn=thread_tools_enabled)
     # Harmless when the tools are off: check_fn drops them before tool_search sees them.
     pin_visible()

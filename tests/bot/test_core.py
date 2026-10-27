@@ -351,3 +351,18 @@ def test_sender_allowed_rejects_unlisted_and_empty_ids():
 
 def test_sender_allowed_allow_all_overrides_the_list():
     assert core.sender_allowed("anyone", frozenset(), True)
+
+
+# -- v1.9.0: threads (Talk 22.0.10+ puts object.threadId on webhook payloads) --
+
+def test_parse_webhook_body_reads_thread_id():
+    payload = _create_payload()
+    payload["object"]["threadId"] = 1500
+    assert core.parse_webhook_body(payload).thread_id == "1500"
+
+
+def test_parse_webhook_body_without_or_zero_thread_is_main_timeline():
+    assert core.parse_webhook_body(_create_payload()).thread_id is None
+    payload = _create_payload()
+    payload["object"]["threadId"] = 0
+    assert core.parse_webhook_body(payload).thread_id is None

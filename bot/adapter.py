@@ -163,6 +163,15 @@ _PLATFORM_HINT = (
 )
 
 
+def _thread_param(metadata: Optional[Dict[str, Any]]) -> Optional[int]:
+    """``threadId`` for a bot post from Hermes' send metadata, or None."""
+    try:
+        value = int(str((metadata or {}).get("thread_id")).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def check_nctalk_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
@@ -481,6 +490,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 chat_type="group",
                 user_id=parsed.actor_id,
                 user_name=parsed.actor_name,
+                thread_id=parsed.thread_id,
             )
             event = MessageEvent(
                 text=text,
@@ -576,9 +586,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
 
         chunks = self.truncate_message(content, max_length=MAX_MESSAGE_LENGTH)
+        # Talk 22.0.10+ bot API takes threadId; every chunk carries it so a
+        # long answer to a thread stays in the thread.
+        thread = _thread_param(metadata)
         last_result: Optional[SendResult] = None
         for i, chunk in enumerate(chunks):
             body_obj: Dict[str, Any] = {"message": chunk}
+            if thread:
+                body_obj["threadId"] = thread
             if reply_to and i == 0:
                 try:
                     body_obj["replyTo"] = int(reply_to)

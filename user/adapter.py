@@ -42,6 +42,12 @@ Environment variables (env wins over config.yaml ``extra``):
     NEXTCLOUD_TALK_ALLOW_ALL_USERS         Allow any user -- dev only
     NEXTCLOUD_TALK_HOME_CHANNEL            Default room token for cron delivery
     NEXTCLOUD_TALK_HOME_CHANNEL_NAME       Human label for the home channel
+    NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID  Thread id (root message id) inside the home channel for
+                                             cron / notification delivery (Talk 22+ threads)
+    NEXTCLOUD_TALK_THREAD_OWNERSHIP        "off" stops treating a thread started by another agent
+                                             (NEXTCLOUD_TALK_AGENT_USERS) as that agent's, where
+                                             this account then only answers when @mentioned
+                                             (default on)
     NEXTCLOUD_TALK_DISCOVERY_INTERVAL_SECONDS  Re-discovery interval (default 30)
     NEXTCLOUD_TALK_MAX_ROOMS                Max concurrent per-room poll tasks (default 20)
     NEXTCLOUD_TALK_WORKING_REACTION        Reaction added while a turn is being processed and
@@ -63,6 +69,11 @@ Environment variables (env wins over config.yaml ``extra``):
                                              read/proxy timeout, since a poll that doesn't return
                                              before that boundary is an error rather than a plain
                                              "nothing new")
+
+Threads (Talk 22+, capability ``threads``): each thread gets its own Hermes
+session, its own context backlog and its own agent-chain counter, and replies
+go back into the thread they came from. Without the capability the adapter
+behaves exactly as before threads existed.
 
 Active listening and the agent-to-agent loop guard only matter in a room
 with more than one participant (DMs are always addressed to this account,
@@ -224,6 +235,27 @@ ACTOR_TYPE_BOTS = "bots"  # Talk's actorType for a webhook-bot sender
 CONTEXT_MESSAGES_ENV = "NEXTCLOUD_TALK_CONTEXT_MESSAGES"
 DEFAULT_CONTEXT_MESSAGES = 40  # per room; 0 turns active listening off
 CONTEXT_MAX_CHARS = 8000       # oldest backlog lines are dropped past this
+
+# Threads (Talk 22+, capability "threads"). The thread id IS the root
+# message's id. One long-poll per room returns every message, thread replies
+# included, each carrying ``threadId``; routing is client-side because Talk
+# does not proxy a thread-filtered chat read for federated rooms.
+THREADS_CAPABILITY = "threads"
+THREADS_HINT = (
+    "Group rooms can have threads: a titled side conversation under one message. "
+    "People post requests in the main timeline. When you take on a task, do the "
+    "work for it inside a thread (talk_thread_start, when you have it, opens one "
+    "titled after the task) instead of filling the main timeline. Reply where you were addressed: "
+    "an answer to a message in a thread goes into that thread on its own. When a "
+    "task finishes, post a one-line result in the main timeline if the room would "
+    "want to know. A thread another agent started is that agent's work: do not "
+    "speak in it unless you are @mentioned there."
+)
+THREAD_OWNERSHIP_ENV = "NEXTCLOUD_TALK_THREAD_OWNERSHIP"
+HOME_THREAD_ENV = "NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID"
+THREAD_LOOKUP_RETRY_SECONDS = 300.0  # an unknown thread root is re-read after this
+THREAD_CACHE_MAX = 2000
+THREAD_ROOT_MAX_CHARS = 1500
 
 _DISPLAY_MODE_PREFIX_RE = re.compile(r"^\s*\[(mention|watch|free)\]", re.IGNORECASE)
 
@@ -388,6 +420,46 @@ def _with_room_rules(text: str, description: Optional[str]) -> str:
     if not description:
         return text
     return f"[Room rules, from the conversation description. Follow them.]\n{description}\n\n{text}"
+
+
+def _message_thread_id(message: Dict[str, Any]) -> Optional[str]:
+    """Thread id of a Talk chat message as a string, or None for the main timeline.
+
+    A thread root carries ``isThread`` and its own id is the thread id; a
+    reply carries ``threadId``. 0, missing or junk means "not in a thread".
+    """
+    raw = message.get("id") if message.get("isThread") else message.get("threadId")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return str(value) if value > 0 else None
+
+
+def _thread_id_int(raw: Any) -> Optional[int]:
+    """A positive int thread id from a metadata/config value, else None."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _ctx_key(token: str, thread_id: Optional[str]):
+    """Key for per-conversation state: the bare token for the main timeline
+    (unchanged from before threads), ``(token, thread_id)`` inside a thread."""
+    return (token, thread_id) if thread_id else token
+
+
+def _with_thread_root(text: str, title: Optional[str], root_line: Optional[str]) -> str:
+    """Prefix the first addressed message in a thread with what the thread is about."""
+    if not title and not root_line:
+        return text
+    head = f'[You are in the Talk thread "{title}".' if title else "[You are in a Talk thread."
+    head += " Your reply goes into this thread.]"
+    if root_line:
+        head += f"\n[Thread started with]\n{root_line[:THREAD_ROOT_MAX_CHARS]}"
+    return f"{head}\n\n{text}"
 
 
 def _trim_backlog(backlog: List[str], max_messages: int) -> List[str]:
@@ -842,6 +914,18 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._dm_mode: str = dm_mode
         # token -> (is a pair room, when last read)
         self._pair_rooms: Dict[str, Tuple[bool, float]] = {}
+        # Threads: off until the server's capabilities list "threads", so an
+        # older Talk sees exactly the pre-thread behavior.
+        self._threads_enabled: bool = False
+        self._capabilities_checked: bool = False
+        raw_ownership = extra.get("thread_ownership")
+        if raw_ownership is None:
+            raw_ownership = os.getenv(THREAD_OWNERSHIP_ENV, "on")
+        self._thread_ownership: bool = str(raw_ownership).strip().lower() not in ("0", "off", "false", "no")
+        # (token, thread id) -> {"actor": {...} or None, "title", "root", "at"}
+        self._threads: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # (token, thread id) pairs whose root was already handed to the model
+        self._thread_root_given: set = set()
 
     # -- Connection lifecycle -------------------------------------------
 
@@ -897,6 +981,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         backoff_idx = 0
         while self._running:
             try:
+                if not self._capabilities_checked:
+                    await self._refresh_capabilities()
                 await self._discover_rooms()
                 await self._discover_invitations()
                 await self._refresh_profile_role()
@@ -913,6 +999,27 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 return
+
+    async def _refresh_capabilities(self) -> None:
+        """Read Talk's feature list once; threads stay off unless it says ``threads``.
+
+        A failed read leaves threads off and is retried on the next discovery
+        pass, so a transient error never turns them on by guesswork.
+        """
+        if not self._http_client:
+            return
+        try:
+            resp = await self._http_client.get("/ocs/v2.php/cloud/capabilities", params={"format": "json"})
+            resp.raise_for_status()
+            caps = resp.json().get("ocs", {}).get("data", {}).get("capabilities", {}) or {}
+        except Exception as e:
+            logger.warning("[%s] capabilities read failed (threads stay off for now): %s", self.name, e)
+            return
+        features = (caps.get("spreed") or {}).get("features") or []
+        self._threads_enabled = THREADS_CAPABILITY in features
+        self._capabilities_checked = True
+        logger.info("[%s] Talk threads %s", self.name,
+                    "enabled" if self._threads_enabled else "not supported by this server (off)")
 
     async def _refresh_profile_role(self, force: bool = False) -> None:
         """Re-read the role prompt from Nextcloud profiles every few minutes.
@@ -1162,7 +1269,11 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return
 
         actor = _extract_actor(message)
-        if actor["id"] == self._username and actor.get("type") != "federated_users":
+        thread_id = _message_thread_id(message) if self._threads_enabled else None
+        if thread_id and message.get("isThread"):
+            # A thread root (ours included): remember who opened it and how.
+            self._note_thread_root(token, thread_id, message, actor)
+        if self._is_self(actor):
             return  # echo of our own send
 
         text = (message.get("message") or "").strip()
@@ -1177,6 +1288,18 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             mode = self._dm_mode
         else:
             mode = _room_mode(token, display_name, self._room_modes)
+
+        thread = await self._thread_info(token, thread_id) if thread_id else None
+        if thread is not None and self._thread_ownership and chat_type != "dm":
+            owner = thread.get("actor")
+            if owner and self._is_self(owner):
+                # Our own thread: the people in it are talking to us.
+                if mode == ROOM_MODE_MENTION:
+                    mode = ROOM_MODE_FREE
+            elif owner and _is_agent_actor(owner, self._agent_users):
+                # Another agent's thread is that agent's work: only an
+                # explicit @mention brings us in, whatever the room mode.
+                mode = ROOM_MODE_MENTION
 
         mentioned = _is_mention(
             text, message.get("messageParameters"), self._username, self._display_name
@@ -1197,6 +1320,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             user_id=actor["id"],
             user_name=actor.get("display_name"),
             message_id=msg_id,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
@@ -1208,30 +1332,34 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             timestamp=self._parse_timestamp(message.get("timestamp")),
         )
 
+        # The loop-guard counter, the context backlog and the session are all
+        # per conversation: the main timeline, or one thread.
+        key = _ctx_key(token, thread_id)
         from_agent = _is_agent_actor(actor, self._agent_users)
         if from_agent:
-            self._agent_chain[token] = self._agent_chain.get(token, 0) + 1
+            self._agent_chain[key] = self._agent_chain.get(key, 0) + 1
         else:
-            self._agent_chain[token] = 0
+            self._agent_chain[key] = 0
 
         if mode == ROOM_MODE_WATCH:
             self._watch_buffers.setdefault(token, []).append(event)
             return
         if mode == ROOM_MODE_MENTION and not mentioned:
-            self._remember(token, actor, text, msg_id)
+            self._remember(token, actor, text, msg_id, thread_id=thread_id)
             return
         if from_agent and chat_type != "dm":
             if not mentioned:
                 # free means free for humans; another agent must still address us
-                self._remember(token, actor, text, msg_id)
+                self._remember(token, actor, text, msg_id, thread_id=thread_id)
                 return
-            if self._agent_chain[token] > self._agent_chain_limit:
+            if self._agent_chain[key] > self._agent_chain_limit:
                 logger.info(
-                    "[%s] room %s: %d agent messages in a row with no human in "
+                    "[%s] room %s%s: %d agent messages in a row with no human in "
                     "between, ignoring %s until a human speaks",
-                    self.name, token, self._agent_chain[token], actor.get("id"),
+                    self.name, token, f" thread {thread_id}" if thread_id else "",
+                    self._agent_chain[key], actor.get("id"),
                 )
-                self._remember(token, actor, text, msg_id)
+                self._remember(token, actor, text, msg_id, thread_id=thread_id)
                 return
             # Another agent addressing us does not oblige an answer: closing a
             # bot-to-bot exchange by staying quiet is correct (room rule:
@@ -1252,10 +1380,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # for the next normal reply.
             await self.handle_message(event)
             return
-        backlog = self._room_context.pop(token, [])
-        self._room_context_ids.pop(token, None)
+        backlog = self._room_context.pop(key, [])
+        self._room_context_ids.pop(key, None)
         if backlog:
             event.text = _with_room_context(text, backlog)
+        if thread is not None and key not in self._thread_root_given:
+            # First turn of this thread's session: say what the thread is.
+            self._thread_root_given.add(key)
+            root = thread.get("root") if not message.get("isThread") else None
+            event.text = _with_thread_root(event.text, thread.get("title"), root)
         if chat_type != "dm" and (self._room_rules_all or token in self._room_modes):
             # Whoever creates a room writes its description; only rooms the
             # operator listed (or an explicit opt-in) may hand the agent rules.
@@ -1346,9 +1479,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         return resp.content
 
     def _remember(
-        self, token: str, actor: Dict[str, Optional[str]], text: str, msg_id: Optional[str] = None
+        self, token: str, actor: Dict[str, Optional[str]], text: str, msg_id: Optional[str] = None,
+        *, thread_id: Optional[str] = None,
     ) -> None:
-        """Keep an unanswered message as context for the next reply in this room."""
+        """Keep an unanswered message as context for the next reply in this room.
+
+        Main timeline and each thread keep separate backlogs. A thread root is
+        a main-timeline message, so it lands in the main backlog; the thread's
+        first turn gets it from the thread info instead.
+        """
         if self._context_messages <= 0:
             return
         if not self._sender_allowed(actor.get("id")):
@@ -1356,24 +1495,31 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # rides into a later turn as room context.
             return
         name = actor.get("display_name") or actor.get("id") or "someone"
-        backlog = self._room_context.setdefault(token, [])
+        key = _ctx_key(token, thread_id if thread_id and msg_id != thread_id else None)
+        backlog = self._room_context.setdefault(key, [])
         line = f"{name}: {text}"
         backlog.append(line)
-        self._room_context[token] = _trim_backlog(backlog, self._context_messages)
+        self._room_context[key] = _trim_backlog(backlog, self._context_messages)
         if msg_id:
-            ids = self._room_context_ids.setdefault(token, {})
+            ids = self._room_context_ids.setdefault(key, {})
             ids[msg_id] = line
             if len(ids) > 4 * max(self._context_messages, 1):
-                kept = set(self._room_context[token])
-                self._room_context_ids[token] = {k: v for k, v in ids.items() if v in kept}
+                kept = set(self._room_context[key])
+                self._room_context_ids[key] = {k: v for k, v in ids.items() if v in kept}
 
     def _apply_backlog_edit(self, token: str, system_message: Dict[str, Any]) -> None:
         """Rewrite or drop the backlog line of an edited/deleted unanswered message."""
         parent = system_message.get("parent") or {}
         parent_id = str(parent.get("id", ""))
-        ids = self._room_context_ids.get(token) or {}
+        # The line may sit in the main backlog or in any of the room's threads.
+        key = next(
+            (k for k, ids in self._room_context_ids.items()
+             if (k == token or (isinstance(k, tuple) and k[0] == token)) and parent_id in ids),
+            token,
+        )
+        ids = self._room_context_ids.get(key) or {}
         old_line = ids.get(parent_id)
-        backlog = self._room_context.get(token) or []
+        backlog = self._room_context.get(key) or []
         if not old_line or old_line not in backlog:
             return
         index = backlog.index(old_line)
@@ -1390,6 +1536,75 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         new_line = f"{name}: {text}"
         backlog[index] = new_line
         ids[parent_id] = new_line
+
+    # -- Threads ---------------------------------------------------------------
+
+    def _is_self(self, actor: Dict[str, Optional[str]]) -> bool:
+        """True for this account's own local actor (a federated namesake is not us)."""
+        return (
+            (actor.get("id") or "").lower() == (self._username or "").lower()
+            and actor.get("type") != "federated_users"
+        )
+
+    def _note_thread_root(
+        self, token: str, thread_id: str, message: Dict[str, Any], actor: Dict[str, Optional[str]]
+    ) -> None:
+        text = _resolve_mention_placeholders(
+            (message.get("message") or "").strip(), message.get("messageParameters"))
+        name = actor.get("display_name") or actor.get("id") or "someone"
+        self._store_thread(token, thread_id, {
+            "actor": actor,
+            "title": message.get("threadTitle") or None,
+            "root": f"{name}: {text}" if text else None,
+            "at": time.time(),
+        })
+
+    def _store_thread(self, token: str, thread_id: str, info: Dict[str, Any]) -> None:
+        if len(self._threads) >= THREAD_CACHE_MAX:
+            # Oldest first; a dropped thread is simply looked up again.
+            for k in sorted(self._threads, key=lambda k: self._threads[k].get("at", 0))[: THREAD_CACHE_MAX // 4]:
+                self._threads.pop(k, None)
+        self._threads[(token, thread_id)] = info
+
+    async def _thread_info(self, token: str, thread_id: str) -> Dict[str, Any]:
+        """Who opened a thread, its title and root line, from cache or the threads API.
+
+        ``GET /chat/{token}/threads/{id}`` is proxied for federated rooms. A
+        failed read gives an unknown owner (the thread then follows the room
+        mode) and is retried after THREAD_LOOKUP_RETRY_SECONDS.
+        """
+        cached = self._threads.get((token, thread_id))
+        if cached and (cached.get("actor") or time.time() - cached.get("at", 0) < THREAD_LOOKUP_RETRY_SECONDS):
+            return cached
+        info: Dict[str, Any] = {"actor": None, "title": None, "root": None, "at": time.time()}
+        if self._http_client is not None:
+            try:
+                resp = await self._http_client.get(
+                    f"/ocs/v2.php/apps/spreed/api/v1/chat/{token}/threads/{thread_id}",
+                    params={"format": "json"},
+                )
+                resp.raise_for_status()
+                data = resp.json().get("ocs", {}).get("data", {}) or {}
+                first = data.get("first") or {}
+                thread = data.get("thread") or {}
+                info["title"] = thread.get("title") or first.get("threadTitle") or None
+                if first.get("actorId"):
+                    actor = _extract_actor(first)
+                    info["actor"] = actor
+                    text = _resolve_mention_placeholders(
+                        (first.get("message") or "").strip(), first.get("messageParameters"))
+                    name = actor.get("display_name") or actor.get("id") or "someone"
+                    info["root"] = f"{name}: {text}" if text else None
+            except Exception as e:
+                logger.debug("[%s] thread %s/%s lookup failed: %s", self.name, token, thread_id, e)
+        self._store_thread(token, thread_id, info)
+        return info
+
+    def _thread_param(self, metadata: Optional[Dict[str, Any]]) -> Optional[int]:
+        """``threadId`` for an outbound post, from Hermes' send metadata (None without threads)."""
+        if not self._threads_enabled or not metadata:
+            return None
+        return _thread_id_int(metadata.get("thread_id"))
 
     @staticmethod
     def _parse_timestamp(unix_ts: Any) -> datetime:
@@ -1469,9 +1684,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="HTTP client not initialized")
 
         chunks = _chunk_message(content)
+        # Every chunk carries the thread: only the first has a replyTo (which
+        # already lands in the thread), so without threadId chunks 2+ would
+        # fall into the main timeline. Talk ignores threadId when replyTo is set.
+        thread = self._thread_param(metadata)
         last_id: Optional[str] = None
         for i, chunk in enumerate(chunks):
             body: Dict[str, Any] = {"message": chunk}
+            if thread:
+                body["threadId"] = thread
             if reply_to and i == 0:
                 try:
                     body["replyTo"] = int(reply_to)
@@ -1552,7 +1773,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # Could not fetch it: the base posts the URL as text, still useful.
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
         name = os.path.basename(image_url.split("?", 1)[0]) or "image.png"
-        return await self._share_bytes(chat_id, data, name, caption, reply_to)
+        return await self._share_bytes(chat_id, data, name, caption, reply_to, metadata=metadata)
 
     async def send_animation(
         self, chat_id: str, animation_url: str, caption: Optional[str] = None,
@@ -1564,31 +1785,34 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self, chat_id: str, image_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
-        return await self._share_path(chat_id, image_path, caption, reply_to)
+        return await self._share_path(chat_id, image_path, caption, reply_to, metadata=metadata)
 
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
-        return await self._share_path(chat_id, video_path, caption, reply_to)
+        return await self._share_path(chat_id, video_path, caption, reply_to, metadata=metadata)
 
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None,
         file_name: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
-        return await self._share_path(chat_id, file_path, caption, reply_to, name=file_name)
+        return await self._share_path(chat_id, file_path, caption, reply_to, name=file_name,
+                                      metadata=metadata)
 
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
         """A Talk voice message (inline player), not a plain audio attachment."""
-        return await self._share_path(chat_id, audio_path, caption, reply_to, voice=True)
+        return await self._share_path(chat_id, audio_path, caption, reply_to, voice=True,
+                                      metadata=metadata)
 
     async def _share_path(
         self, chat_id: str, path: str, caption: Optional[str], reply_to: Optional[str],
         *, name: Optional[str] = None, voice: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if path.startswith("file://"):
             from urllib.request import url2pathname
@@ -1599,11 +1823,13 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         except OSError as e:
             return SendResult(success=False, error=f"cannot read {path}: {e}")
         return await self._share_bytes(
-            chat_id, data, name or os.path.basename(path), caption, reply_to, voice=voice)
+            chat_id, data, name or os.path.basename(path), caption, reply_to, voice=voice,
+            metadata=metadata)
 
     async def _share_bytes(
         self, chat_id: str, data: bytes, filename: str, caption: Optional[str],
         reply_to: Optional[str], *, voice: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Upload *data* to ``Talk/`` in the agent's Files and share it into the room.
 
@@ -1637,7 +1863,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"upload failed: HTTP {put.status_code}")
 
         if federated:
-            return await self._post_public_link(chat_id, remote, safe, caption, reply_to)
+            return await self._post_public_link(chat_id, remote, safe, caption, reply_to, metadata)
 
         meta: Dict[str, Any] = {}
         if caption:
@@ -1649,6 +1875,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 pass
         if voice:
             meta["messageType"] = "voice-message"
+        thread = self._thread_param(metadata)
+        if thread:
+            meta["threadId"] = thread
         form = {"shareType": "10", "shareWith": chat_id, "path": f"/{remote}"}
         if meta:
             form["talkMetaData"] = json.dumps(meta)
@@ -1665,6 +1894,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
 
     async def _post_public_link(
         self, chat_id: str, remote: str, name: str, caption: Optional[str], reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         expire = time.strftime("%Y-%m-%d", time.gmtime(time.time() + FEDERATED_LINK_DAYS * 86400))
         try:
@@ -1680,7 +1910,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"link share failed: HTTP {resp.status_code}")
         text = f"{caption}\n" if caption else ""
         text += f"📎 {name} (link expires {expire}): {url}"
-        return await self.send(chat_id, text, reply_to=reply_to)
+        return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
     async def _fetch_url(self, url: str) -> Optional[bytes]:
         """Fetch an image URL (http/https/file) for re-upload; None on any failure."""
@@ -1817,6 +2047,9 @@ def _env_enablement() -> Optional[dict]:
             "chat_id": home,
             "name": os.getenv("NEXTCLOUD_TALK_HOME_CHANNEL_NAME", home),
         }
+        home_thread = _thread_id_int(os.getenv(HOME_THREAD_ENV, ""))
+        if home_thread:
+            seed["home_channel"]["thread_id"] = str(home_thread)
     return seed
 
 
@@ -1842,14 +2075,20 @@ async def _standalone_send(
 
     headers = _ocs_headers(username, app_password)
     chunks = _chunk_message(message)
+    # Hermes resolves the target's thread (for cron: <HOME_CHANNEL>_THREAD_ID)
+    # and hands it over here; every chunk goes into that thread.
+    thread = _thread_id_int(thread_id)
     try:
         async with httpx.AsyncClient(base_url=server, headers=headers, timeout=15.0) as client:
             last_id = None
             for chunk in chunks:
+                body: Dict[str, Any] = {"message": chunk}
+                if thread:
+                    body["threadId"] = thread
                 resp = await client.post(
                     f"/ocs/v2.php/apps/spreed/api/v1/chat/{chat_id}",
                     params={"format": "json"},
-                    json={"message": chunk},
+                    json=body,
                 )
                 if resp.status_code >= 300:
                     return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
@@ -1892,9 +2131,8 @@ def register(ctx) -> None:
         platform_hint=(
             "You are on Nextcloud Talk. Messages support basic Markdown "
             "(bold/italic/inline code) and @mentions use Talk's "
-            '@"Display Name" syntax for names with spaces. There are no '
-            "threads; replies are flat in the room timeline. Keep "
+            '@"Display Name" syntax for names with spaces. Keep '
             "responses concise -- up to 32000 characters per message, "
-            "longer replies are sent as multiple messages."
+            "longer replies are sent as multiple messages. " + THREADS_HINT
         ),
     )

@@ -138,6 +138,53 @@ turn into an infinite agent-to-agent reply loop:
   matches both the local user and the same id on any federated instance
   (`ops-bot@remote-instance`); a qualified entry matches only that exact id.
 
+### Threads (Talk 22+)
+
+Talk 22 added threads: a titled side conversation rooted at one message of a
+group room (the thread id is the root message id). When the server's
+capabilities list `threads` (read once at connect), user mode:
+
+- gives each thread its own Hermes session (the session key gets the thread
+  id), its own context backlog and its own agent-chain counter
+  (`NEXTCLOUD_TALK_AGENT_CHAIN_LIMIT` counts per room *and* thread). The main
+  timeline backlog never holds thread replies, and a thread's first turn is
+  told the thread's title and root message.
+- answers in the thread it was addressed in: every chunk of a long reply and
+  every file share (`talkMetaData.threadId`) carries the thread id, not just
+  the first chunk's `replyTo`. Cron and `send_message` deliveries honour a
+  thread id too; `NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID` points cron delivery
+  into a thread of the home channel.
+- keeps one long-poll per room and routes by each message's `threadId`, since
+  Talk does not proxy a thread-filtered chat read for federated rooms.
+- adds two tools (toolset `nctalk-threads`, on whenever user-mode credentials
+  are set, `NEXTCLOUD_TALK_THREAD_TOOLS=off` hides them):
+  `talk_thread_start(title, message, room?)` opens a thread and returns its
+  `thread_id`; `talk_thread_reply(message, thread_id?, room?)` posts into one
+  (default: the thread the current turn came from). `room` follows the same
+  rule as the call tools: empty means this chat.
+
+**Thread ownership** (`NEXTCLOUD_TALK_THREAD_OWNERSHIP`, default `on`). In a
+room shared by several agents, a thread started by another agent listed in
+`NEXTCLOUD_TALK_AGENT_USERS` is that agent's work: this account answers there
+only when @mentioned, whatever the room mode (also in `free` and `watch`
+rooms). A thread this account started answers its people without an @mention
+(other agents still have to address it). Threads started by humans follow the
+room mode. The thread's creator comes from its root message, or from
+`GET /chat/{token}/threads/{id}` when the root predates the connection; if that
+read fails the thread follows the room mode. `off` makes every thread follow
+the room mode.
+
+The Talk channel prompt tells the model the convention: people post at top
+level, task work happens in a thread, reply where you were addressed, post a
+one-line result at top level when a task finishes, and stay out of other
+agents' threads unless @mentioned.
+
+Bot mode reads `object.threadId` from the webhook (Talk 22.0.10+) into the
+session and posts replies with `threadId`; bots cannot open threads here.
+
+Without the `threads` capability (or if the capability read fails) nothing of
+this applies and the adapter behaves exactly like 1.8.4.
+
 ### Active listening (user mode)
 
 A message this account does not answer -- an un-mentioned message in a
@@ -298,7 +345,7 @@ Combined (both modes available, pick one via credentials as above):
 
 ```
 mkdir -p ~/.hermes/plugins/nctalk
-cp -r __init__.py plugin.yaml bot user ~/.hermes/plugins/nctalk/
+cp -r __init__.py plugin.yaml tools.py bot user ~/.hermes/plugins/nctalk/
 ```
 
 Bot mode only:
@@ -331,7 +378,8 @@ cp user/__init__.py ~/.hermes/plugins/nctalk_user/__init__.py
   bot's webhook/HMAC machinery, so it was not worth splitting into a
   separate core module).
 - `tools.py` -- the opt-in call tools (`call_join`, `call_leave`,
-  `call_status`); stdlib only, tested in `tests/call_tools/`.
+  `call_status`) and the thread tools (`talk_thread_start`,
+  `talk_thread_reply`); stdlib at import time, tested in `tests/call_tools/`.
 - `tests/bot/`, `tests/user_mode/` -- each mode's tests (the user-mode test
   directory is not named `tests/user` to avoid shadowing the `user/`
   package on `sys.path`), against
