@@ -418,7 +418,7 @@ def pin_visible() -> bool:
         import importlib
         ts = importlib.import_module(_TOOL_SEARCH_MODULE)
         current = getattr(ts, _DIRECT_ATTR)
-        wanted = {TOOLSET, THREAD_TOOLSET}
+        wanted = {TOOLSET, THREAD_TOOLSET, POLL_TOOLSET, CAPS_TOOLSET}
         if not wanted <= set(current):
             setattr(ts, _DIRECT_ATTR, frozenset(current) | wanted)
         return True
@@ -594,7 +594,10 @@ def talk_thread_start(args: dict, **_kw: Any) -> str:
         return _result(error=err)
     if not room_has_threads(room):
         return _result(error=_NO_THREADS)
-    mid, err = _post_chat(room, {"message": message, "threadTitle": title})
+    body = {"message": message, "threadTitle": title}
+    if _truthy(args.get("silent")):
+        body["silent"] = True
+    mid, err = _post_chat(room, body)
     if err:
         return _result(error=f"could not start the thread: {err}")
     out = {"status": "created", "room": room, "title": title, "thread_id": mid,
@@ -633,7 +636,10 @@ def talk_thread_reply(args: dict, **_kw: Any) -> str:
             if title.startswith(CLOSED_MARK):
                 _rename(room, thread, title[len(CLOSED_MARK):])
             reopened = True
-    mid, err = _post_chat(room, {"message": message, "threadId": int(thread)})
+    body = {"message": message, "threadId": int(thread)}
+    if _truthy(args.get("silent")):
+        body["silent"] = True
+    mid, err = _post_chat(room, body)
     if err:
         return _result(error=f"could not post into thread {thread}: {err}")
     out = {"status": "posted", "room": room, "thread_id": thread, "message_id": mid}
@@ -722,6 +728,8 @@ TALK_THREAD_START_SCHEMA = {
             "title": {"type": "string",
                       "description": "Short thread title naming the task (required, one line)."},
             "message": {"type": "string", "description": "The thread's first message (required)."},
+            "silent": {"type": "boolean",
+                       "description": "Post without notifying anyone (a quiet progress note)."},
             "room": _ROOM_PROP,
             OVERRIDE_ARG: _OTHER_ROOM_PROP,
         },
@@ -746,6 +754,8 @@ TALK_THREAD_REPLY_SCHEMA = {
             "reopen": {"type": "boolean",
                        "description": ("Post into a thread you closed, reopening it. Only when the "
                                        "person asked to pick that matter back up.")},
+            "silent": {"type": "boolean",
+                       "description": "Post without notifying anyone (a quiet progress note)."},
             "room": _ROOM_PROP,
             OVERRIDE_ARG: _OTHER_ROOM_PROP,
         },
@@ -799,6 +809,632 @@ THREAD_TOOLS = (
 )
 
 
+# ------------------------------------------------------------------- polls
+# Talk 24.0.6 facts this code is built on (spreed source + live probes 2026-10-30):
+# - POST /poll/{token} refuses one-to-one conversations (400 error "room").
+# - threadId puts a poll inside a thread, except from a federated copy of a room:
+#   the proxy drops threadId and the poll lands in the host's main timeline.
+# - The author sees only numVoters while a poll is open; closing it reveals who
+#   voted what (public result mode). A vote posts an anonymous "poll_voted"
+#   system message in the main timeline (public mode only).
+# - Reactions, and their "reaction" system messages, work in DMs, threads and
+#   federated rooms. So where a native poll cannot go, the tool posts a numbered
+#   "reaction poll" the person answers by tapping 1, 2 or 3.
+POLL_TOOLSET = "nctalk-polls"
+POLL_ENABLE_ENV = "NEXTCLOUD_TALK_POLL_TOOLS"
+POLL_OPTIONS_MAX = 6
+POLL_QUESTION_MAX = 300
+POLL_OPTION_MAX = 120
+_POLL_PATH = "/ocs/v2.php/apps/spreed/api/v1/poll/{room}"
+_REACTION_PATH = "/ocs/v2.php/apps/spreed/api/v1/reaction/{room}/{message}"
+_ROOM_PATH = "/ocs/v2.php/apps/spreed/api/v4/room/{room}"
+ROOM_TYPE_ONE_TO_ONE = 1
+POLL_MARK = "\U0001F4CA"  # bar chart, leads a reaction poll's text
+
+_room_info_cache: dict = {}
+
+
+def _pollstate():
+    """user/pollstate.py, importable both as part of the plugin package and when
+    this file is loaded on its own (tests, CLI pre-registration)."""
+    try:
+        from .user import pollstate  # type: ignore
+        return pollstate
+    except Exception:
+        import importlib.util
+        import sys
+        name = "nctalk_pollstate"
+        if name in sys.modules:
+            return sys.modules[name]
+        spec = importlib.util.spec_from_file_location(
+            name, os.path.join(os.path.dirname(os.path.abspath(__file__)), "user", "pollstate.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+
+def _poll_store():
+    server, user, _pw = _talk_credentials()
+    return _pollstate().state_path(server, user)
+
+
+def poll_tools_enabled() -> bool:
+    if _env(POLL_ENABLE_ENV, "on").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    server, _user, password = _talk_credentials()
+    return bool(server and password)
+
+
+def _room_info(room: str) -> dict:
+    """{type, federated} for a room, cached 10 minutes; {} when unreadable."""
+    import time
+
+    cached = _room_info_cache.get(room)
+    if cached and time.time() - cached[0] < CAPS_TTL_SECONDS:
+        return cached[1]
+    try:
+        status, data = _request("GET", _ROOM_PATH.format(room=room))
+    except Exception:
+        return {}
+    if status >= 300 or not isinstance(data, dict):
+        return {}
+    info = {"type": data.get("type"), "federated": bool(data.get("remoteServer"))}
+    _room_info_cache[room] = (time.time(), info)
+    return info
+
+
+def _clean_options(raw: Any) -> list:
+    if isinstance(raw, str):
+        raw = [p for p in re.split(r"[\n|]", raw)]
+    out = []
+    for o in raw or []:
+        o = _one_line(o, POLL_OPTION_MAX)
+        if o and o not in out:
+            out.append(o)
+    return out
+
+
+def _poll_text(question: str, options: list, fill_in: bool, multi: bool) -> str:
+    ps = _pollstate()
+    lines = [f"{POLL_MARK} **{question}**", ""]
+    for i, o in enumerate(options):
+        lines.append(f"{ps.KEYCAPS[i]} {o}")
+    if fill_in:
+        lines.append("\U0001F4AC Something else: just reply here")
+    lines.append("")
+    lines.append("Tap the numbers you want." if multi else "Tap a number to answer.")
+    return "\n".join(lines)
+
+
+def _add_reaction(room: str, message: str, emoji: str) -> bool:
+    try:
+        status, _ = _request("POST", _REACTION_PATH.format(room=room, message=message),
+                             json_body={"reaction": emoji})
+    except Exception:
+        return False
+    return status < 300
+
+
+def talk_poll_create(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    ps = _pollstate()
+    question = _one_line(args.get("question"), POLL_QUESTION_MAX)
+    options = _clean_options(args.get("options"))
+    fill_in = args.get("fill_in") is None or _truthy(args.get("fill_in"))
+    multi = _truthy(args.get("multi"))
+    if not question:
+        return _result(error="question is required")
+    options = [o for o in options if o.lower() not in (ps.FILL_IN_LABEL.lower(), "something else", "other")]
+    if len(options) < 2:
+        return _result(error="give 2 to %d options (the top choices); a fill-in line is added "
+                             "for you unless fill_in=false" % POLL_OPTIONS_MAX)
+    if len(options) > POLL_OPTIONS_MAX:
+        return _result(error=f"at most {POLL_OPTIONS_MAX} options: keep it to the top 3 or so")
+    room, err, note = _resolve_room(args)
+    if err:
+        return _result(error=err)
+    explicit = str(args.get("thread_id") or "").strip()
+    thread = explicit or (current_thread() if room == current_room() else "")
+    if thread and (not thread.isdigit() or int(thread) <= 0):
+        return _result(error=f"invalid thread_id {thread!r}")
+    store = _poll_store()
+    existing = ps.find(store, room=room, thread=thread)
+    if existing:
+        e = existing[0]
+        return _result(error=(f"there is already an open poll here ({e['question']!r}, poll {e['key']}); "
+                              "close it with talk_poll_close first: one open poll per thread"))
+    if thread and not room_has_threads(room):
+        return _result(error=_NO_THREADS)
+    info = _room_info(room)
+    use_reactions = (info.get("type") == ROOM_TYPE_ONE_TO_ONE
+                     or (info.get("federated") and bool(thread))
+                     or _truthy(args.get("reaction_poll")))
+    wait_for = 1
+    try:
+        wait_for = max(1, min(20, int(args.get("wait_for_votes") or 1)))
+    except (TypeError, ValueError):
+        pass
+    rec = {"room": room, "thread": thread, "question": question, "options": options,
+           "fill_in": fill_in, "multi": multi, "wait_for": wait_for}
+    if use_reactions:
+        if len(options) > len(ps.KEYCAPS):
+            return _result(error="too many options for a reaction poll")
+        body: dict = {"message": _poll_text(question, options, fill_in, multi)}
+        if thread:
+            body["threadId"] = int(thread)
+        mid, perr = _post_chat(room, body)
+        if perr or not mid:
+            return _result(error=f"could not post the poll: {perr or 'no message id returned'}")
+        for i in range(len(options)):
+            _add_reaction(room, mid, ps.KEYCAPS[i])
+        rec.update(kind="reaction", message_id=mid, key=ps.record_key("reaction", room, mid))
+        ps.add(store, rec)
+        why = ("Talk has no polls in one-to-one chats" if info.get("type") == ROOM_TYPE_ONE_TO_ONE
+               else "a poll started from a federated room cannot go inside a thread"
+               if info.get("federated") and thread else "asked for")
+        return _result(**_with_note({
+            "status": "posted", "kind": "reaction", "poll": rec["key"], "room": room,
+            "thread_id": thread or None, "message_id": mid,
+            "note": (f"Posted as a numbered reaction poll ({why}). When they tap a number or "
+                     "reply in the thread you get a new turn with the answer; do not ask again "
+                     "meanwhile.")}, note))
+    if options and fill_in:
+        options = options + [ps.FILL_IN_LABEL]
+    body = {"question": question, "options": options, "resultMode": 0,
+            "maxVotes": 0 if multi else 1}
+    if thread:
+        body["threadId"] = int(thread)
+    try:
+        status, data = _request("POST", _POLL_PATH.format(room=room), json_body=body)
+    except Exception as e:
+        return _result(error=f"could not create the poll: {e}")
+    if status >= 300 or not isinstance(data, dict) or not data.get("id"):
+        err = (data or {}).get("error") if isinstance(data, dict) else data
+        return _result(error=f"could not create the poll: HTTP {status} {err}")
+    pid = str(data["id"])
+    rec.update(kind="native", poll_id=pid, options=options, key=ps.record_key("native", room, pid))
+    ps.add(store, rec)
+    return _result(**_with_note({
+        "status": "created", "kind": "native", "poll": rec["key"], "poll_id": pid, "room": room,
+        "thread_id": thread or None,
+        "note": ("Talk poll posted. When they vote or reply in the thread you get a new turn with "
+                 "the answer; do not ask again meanwhile.")}, note))
+
+
+def _resolve_poll(args: dict, room: str) -> tuple[Optional[dict], Optional[str]]:
+    ps = _pollstate()
+    store = _poll_store()
+    key = str(args.get("poll") or "").strip()
+    if key:
+        rec = ps.get(store, key)
+        if not rec:
+            # Also accept a bare native poll id or reaction message id.
+            hits = ps.find(store, room=room, status=None, poll_id=key) or ps.find(
+                store, room=room, status=None, message_id=key)
+            rec = hits[0] if hits else None
+        return (rec, None) if rec else (None, f"no poll {key!r} known in this room")
+    thread = str(args.get("thread_id") or "").strip() or (
+        current_thread() if room == current_room() else "")
+    hits = ps.find(store, room=room, thread=thread)
+    if not hits:
+        return None, "no open poll in this thread; pass poll (the id talk_poll_create returned)"
+    return hits[0], None
+
+
+def _reaction_votes(room: str, rec: dict) -> tuple[dict, Optional[str]]:
+    """{option index: [voter names]} from the reactions on a reaction poll."""
+    ps = _pollstate()
+    try:
+        status, data = _request("GET", _REACTION_PATH.format(room=room, message=rec["message_id"]))
+    except Exception as e:
+        return {}, f"reaction read failed: {e}"
+    if status >= 300 or not isinstance(data, dict):
+        return {}, f"reaction read failed: HTTP {status}"
+    me = _talk_credentials()[1].lower()
+    votes: dict = {}
+    for emoji, people in data.items():
+        idx = ps.keycap_index(emoji)
+        if idx is None or idx >= len(rec.get("options") or []):
+            continue
+        for p in people or []:
+            if (p.get("actorId") or "").lower() == me and p.get("actorType") == "users":
+                continue  # our own pre-placed reaction
+            votes.setdefault(idx, []).append(p.get("actorDisplayName") or p.get("actorId"))
+    return votes, None
+
+
+def _native_summary(data: dict) -> dict:
+    opts = data.get("options") or []
+    counts = {}
+    for k, v in (data.get("votes") or {}).items():
+        try:
+            counts[opts[int(str(k).split("-")[-1])]] = v
+        except (ValueError, IndexError):
+            pass
+    voters = {}
+    for d in data.get("details") or []:
+        try:
+            voters.setdefault(opts[int(d.get("optionId"))], []).append(
+                d.get("actorDisplayName") or d.get("actorId"))
+        except (TypeError, ValueError, IndexError):
+            pass
+    return {"closed": data.get("status") == 1, "voters": data.get("numVoters"),
+            "counts": counts, "who": voters}
+
+
+def talk_poll_status(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    room, err, note = _resolve_room(args)
+    if err:
+        return _result(error=err)
+    rec, err = _resolve_poll(args, room)
+    if err:
+        return _result(error=err)
+    out = {"poll": rec["key"], "kind": rec["kind"], "question": rec["question"],
+           "options": rec["options"], "status": rec.get("status"), "decided": rec.get("result")}
+    if rec["kind"] == "reaction":
+        votes, verr = _reaction_votes(room, rec)
+        if verr:
+            return _result(error=verr)
+        out["votes"] = {rec["options"][i]: who for i, who in sorted(votes.items())}
+    else:
+        try:
+            status, data = _request("GET", _POLL_PATH.format(room=room) + f"/{rec['poll_id']}")
+        except Exception as e:
+            return _result(error=f"poll read failed: {e}")
+        if status >= 300 or not isinstance(data, dict):
+            return _result(error=f"poll read failed: HTTP {status}")
+        out.update(_native_summary(data))
+        if not out["closed"]:
+            out["note"] = ("Talk hides who voted for what until the poll is closed; you see only "
+                           "how many voted. talk_poll_close reveals the result.")
+    return _result(**_with_note(out, note))
+
+
+def close_native(room: str, poll_id: str) -> tuple[Optional[dict], Optional[str]]:
+    try:
+        status, data = _request("DELETE", _POLL_PATH.format(room=room) + f"/{poll_id}")
+    except Exception as e:
+        return None, f"poll close failed: {e}"
+    if status == 400:
+        # Already closed (by a person, or us): read it instead.
+        status, data = _request("GET", _POLL_PATH.format(room=room) + f"/{poll_id}")
+    if status >= 300 or not isinstance(data, dict):
+        return None, f"poll close failed: HTTP {status}"
+    return data, None
+
+
+def talk_poll_close(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    ps = _pollstate()
+    room, err, note = _resolve_room(args)
+    if err:
+        return _result(error=err)
+    rec, err = _resolve_poll(args, room)
+    if err:
+        return _result(error=err)
+    out = {"poll": rec["key"], "question": rec["question"]}
+    if rec["kind"] == "reaction":
+        votes, _verr = _reaction_votes(room, rec)
+        out["votes"] = {rec["options"][i]: who for i, who in sorted(votes.items())}
+    else:
+        data, cerr = close_native(room, rec["poll_id"])
+        if cerr:
+            return _result(error=cerr)
+        out.update(_native_summary(data))
+    ps.update(_poll_store(), rec["key"], status="closed")
+    out["status"] = "closed"
+    return _result(**_with_note(out, note))
+
+
+_POLL_HINT = (" Yes/no approvals are NOT polls: ask in one line and the person answers with a "
+              "check mark or cross reaction. Use a poll only to choose between 2 to 4 real "
+              "directions, never for trivial things, at most one open poll per thread.")
+
+TALK_POLL_CREATE_SCHEMA = {
+    "name": "talk_poll_create",
+    "description": (
+        "Ask the person to pick a direction with a poll in this Talk chat or thread: give the "
+        "top 2 to 4 choices; a 'Something else (reply in this thread)' line is added so they can "
+        "steer in their own words. You get a new turn with their answer (a vote, or a reply in "
+        "the thread), so after posting just stop and wait. Where Talk has no polls (one-to-one "
+        "chats, threads of a federated room) it posts a numbered message they answer by "
+        "tapping 1, 2 or 3." + _POLL_HINT + _THREAD_ROOM_HINT),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "The question, one line (required)."},
+            "options": {"type": "array", "items": {"type": "string"},
+                        "description": "2 to 6 short choices, best first (required). Do not add 'other'."},
+            "multi": {"type": "boolean", "description": "Allow picking several (default false)."},
+            "fill_in": {"type": "boolean",
+                        "description": "Add the 'something else, reply here' line (default true)."},
+            "wait_for_votes": {"type": "integer",
+                               "description": "Votes before you get the result (default 1; more only "
+                                              "when several people should weigh in)."},
+            "thread_id": {"type": "string",
+                          "description": "Thread to post in; empty means the thread this turn came from."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
+        },
+        "required": ["question", "options"],
+    },
+}
+
+TALK_POLL_STATUS_SCHEMA = {
+    "name": "talk_poll_status",
+    "description": ("Check a poll you started: votes so far (a Talk poll shows only the voter "
+                    "count until closed), or what was decided." + _THREAD_ROOM_HINT),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "poll": {"type": "string", "description": "Poll id from talk_poll_create; empty means "
+                                                      "the open poll in this thread."},
+            "thread_id": {"type": "string", "description": "Thread to look in (default: this one)."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
+        },
+    },
+}
+
+TALK_POLL_CLOSE_SCHEMA = {
+    "name": "talk_poll_close",
+    "description": ("Close a poll you started and get its result (who picked what). Use it when "
+                    "the question is settled another way or you must decide without waiting."
+                    + _THREAD_ROOM_HINT),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "poll": {"type": "string", "description": "Poll id; empty means the open poll in this thread."},
+            "thread_id": {"type": "string", "description": "Thread to look in (default: this one)."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
+        },
+    },
+}
+
+POLL_TOOLS = (
+    ("talk_poll_create", TALK_POLL_CREATE_SCHEMA, talk_poll_create, POLL_MARK),
+    ("talk_poll_status", TALK_POLL_STATUS_SCHEMA, talk_poll_status, "\U0001F50E"),
+    ("talk_poll_close", TALK_POLL_CLOSE_SCHEMA, talk_poll_close, "\U0001F3C1"),
+)
+
+
+# ------------------------------------------------------- server capabilities
+# Extra Talk/Nextcloud features wired as tools, each verified live on Talk 24.0.6
+# (nor and nam, 2026-10-30). Gated on the server's own capability list.
+CAPS_TOOLSET = "nctalk-server"
+CAPS_ENABLE_ENV = "NEXTCLOUD_TALK_SERVER_TOOLS"
+_SCHEDULE_PATH = "/ocs/v2.php/apps/spreed/api/v1/chat/{room}/schedule"
+SCHEDULE_MAX_DAYS = 365
+OCS_RESULT_MAX = 8000
+
+_REL_RE = re.compile(r"^\s*(?:in\s+)?\+?(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hrs?|hours?|d|days?)\s*$",
+                     re.IGNORECASE)
+
+
+def server_tools_enabled() -> bool:
+    if _env(CAPS_ENABLE_ENV, "on").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    server, _user, password = _talk_credentials()
+    return bool(server and password)
+
+
+def _server_features() -> list:
+    """Talk feature list of the agent's own server (cached with the thread check)."""
+    import time
+
+    server = _talk_credentials()[0]
+    cached = _caps_cache.get(("features", server))
+    if cached and time.time() - cached[0] < CAPS_TTL_SECONDS:
+        return cached[1]
+    status, data = _request("GET", "/ocs/v2.php/cloud/capabilities")
+    if status >= 300 or not isinstance(data, dict):
+        return []
+    feats = ((data.get("capabilities") or {}).get("spreed") or {}).get("features") or []
+    _caps_cache[("features", server)] = (time.time(), feats)
+    return feats
+
+
+def parse_when(raw: Any, now: Optional[float] = None) -> Optional[int]:
+    """Unix time from "in 2 hours" / "90m" / "1d" or an ISO 8601 date-time.
+    A date-time without a zone is the gateway host's local time."""
+    import datetime as _dt
+    import time
+
+    now = time.time() if now is None else now
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    m = _REL_RE.match(text)
+    if m:
+        n, unit = float(m.group(1)), m.group(2).lower()
+        mult = 60 if unit.startswith("m") else 3600 if unit.startswith("h") else 86400
+        return int(now + n * mult)
+    try:
+        dt = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # local time of this host
+    return int(dt.timestamp())
+
+
+def talk_message_schedule(args: dict, **_kw: Any) -> str:
+    import datetime as _dt
+    import time
+
+    args = args or {}
+    room, err, note = _resolve_room(args)
+    if err:
+        return _result(error=err)
+    if "scheduled-messages" not in _server_features():
+        return _result(error="this server's Talk has no scheduled messages")
+    if _room_info(room).get("federated"):
+        return _result(error=("Talk cannot schedule messages in a federated room (the host refuses "
+                              "it). Schedule it in a chat on this server, or use a cron job."))
+    action = str(args.get("action") or "schedule").strip().lower()
+    path = _SCHEDULE_PATH.format(room=room)
+    if action == "list":
+        try:
+            status, data = _request("GET", path)
+        except Exception as e:
+            return _result(error=f"could not list scheduled messages: {e}")
+        if status >= 300 or not isinstance(data, list):
+            return _result(error=f"could not list scheduled messages: HTTP {status}")
+        items = [{"id": d.get("id"), "send_at": d.get("sendAt"),
+                  "send_at_local": _dt.datetime.fromtimestamp(int(d.get("sendAt") or 0)).astimezone().isoformat(timespec="minutes"),
+                  "thread_id": d.get("threadId") or None, "silent": d.get("silent"),
+                  "message": _one_line(d.get("message"), 160)} for d in data]
+        return _result(**_with_note({"room": room, "scheduled": items}, note))
+    if action == "cancel":
+        sid = str(args.get("scheduled_id") or "").strip()
+        if not sid.isdigit():
+            return _result(error="scheduled_id is required to cancel (from action=list)")
+        try:
+            status, data = _request("DELETE", f"{path}/{sid}")
+        except Exception as e:
+            return _result(error=f"cancel failed: {e}")
+        if status >= 300:
+            return _result(error=f"cancel failed: HTTP {status}")
+        return _result(**_with_note({"status": "cancelled", "room": room, "scheduled_id": sid}, note))
+    message = str(args.get("message") or "").strip()[:THREAD_MESSAGE_MAX]
+    if not message:
+        return _result(error="message is required")
+    send_at = parse_when(args.get("when"))
+    if send_at is None:
+        return _result(error="when is required: e.g. 'in 2 hours', '30m', '1d' or 2026-11-02T09:00")
+    if send_at <= time.time() + 30:
+        return _result(error="when must be at least a minute from now")
+    if send_at > time.time() + SCHEDULE_MAX_DAYS * 86400:
+        return _result(error=f"when must be within {SCHEDULE_MAX_DAYS} days")
+    body: dict = {"message": message, "sendAt": send_at, "silent": _truthy(args.get("silent"))}
+    explicit = str(args.get("thread_id") or "").strip()
+    thread = explicit or (current_thread() if room == current_room() else "")
+    if thread:
+        if not thread.isdigit():
+            return _result(error=f"invalid thread_id {thread!r}")
+        body["threadId"] = int(thread)
+    try:
+        status, data = _request("POST", path, json_body=body)
+    except Exception as e:
+        return _result(error=f"could not schedule: {e}")
+    if status >= 300 or not isinstance(data, dict):
+        err = (data or {}).get("error") if isinstance(data, dict) else ""
+        return _result(error=f"could not schedule: HTTP {status} {err or ''}".strip())
+    local = _dt.datetime.fromtimestamp(send_at).astimezone().isoformat(timespec="minutes")
+    return _result(**_with_note({
+        "status": "scheduled", "room": room, "scheduled_id": data.get("id"), "send_at": send_at,
+        "send_at_local": local, "thread_id": thread or None,
+        "note": "Talk posts it as you at that time (the server's background job, within a few minutes)."},
+        note))
+
+
+# Read-only lookups, plus the writes the wired tools already make. Anything else
+# (admin, provisioning, sharing, files, settings) is refused. Paths are matched
+# whole, without query string; params go separately.
+_TOK = r"[a-z0-9]{4,32}"
+OCS_ALLOW = (
+    ("GET", r"/ocs/v2\.php/cloud/capabilities"),
+    ("GET", r"/ocs/v2\.php/cloud/user"),
+    ("GET", r"/ocs/v2\.php/cloud/users/[A-Za-z0-9_.@-]{1,64}"),
+    ("GET", r"/ocs/v2\.php/apps/user_status/api/v1/statuses(/[A-Za-z0-9_.@-]{1,64})?"),
+    ("GET", r"/ocs/v2\.php/search/providers(/[a-z0-9_-]{1,40}/search)?"),
+    ("GET", rf"/ocs/v2\.php/apps/spreed/api/v4/room(/{_TOK}(/participants|/capabilities)?)?"),
+    ("GET", rf"/ocs/v2\.php/apps/spreed/api/v1/chat/{_TOK}(/threads(/recent|/\d+)?|/schedule|/\d+/context|/share(/overview)?)?"),
+    ("GET", rf"/ocs/v2\.php/apps/spreed/api/v1/poll/{_TOK}/\d+"),
+    ("GET", rf"/ocs/v2\.php/apps/spreed/api/v1/reaction/{_TOK}/\d+"),
+    ("POST", rf"/ocs/v2\.php/apps/spreed/api/v1/reaction/{_TOK}/\d+"),
+    ("DELETE", rf"/ocs/v2\.php/apps/spreed/api/v1/reaction/{_TOK}/\d+"),
+    ("POST", rf"/ocs/v2\.php/apps/spreed/api/v1/chat/{_TOK}/threads/\d+/notify"),
+)
+_OCS_ALLOW_RE = [(m, re.compile(p + r"\Z")) for m, p in OCS_ALLOW]
+
+
+def ocs_allowed(method: str, path: str) -> bool:
+    if "?" in path or ".." in path or "//" in path:
+        return False
+    return any(m == method and rx.match(path) for m, rx in _OCS_ALLOW_RE)
+
+
+def nextcloud_ocs_call(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    method = str(args.get("method") or "GET").strip().upper()
+    path = str(args.get("path") or "").strip()
+    if path.startswith("http"):
+        return _result(error="give the path only (starting /ocs/v2.php/...), not a URL")
+    if not ocs_allowed(method, path):
+        return _result(error=(f"{method} {path} is not on the allowlist. Allowed: "
+                              + "; ".join(f"{m} {p.replace(chr(92), '')}" for m, p in OCS_ALLOW)))
+    params = args.get("params") if isinstance(args.get("params"), dict) else None
+    body = args.get("body") if isinstance(args.get("body"), dict) else None
+    try:
+        status, data = _request(method, path, json_body=body, params=params)
+    except Exception as e:
+        return _result(error=f"request failed: {e}")
+    text = json.dumps(data, ensure_ascii=False)
+    out = {"status": status, "data": data}
+    if len(text) > OCS_RESULT_MAX:
+        out = {"status": status, "data_truncated": text[:OCS_RESULT_MAX],
+               "note": "truncated: narrow the request (limit param, or a more specific path)"}
+    return _result(**out)
+
+
+TALK_MESSAGE_SCHEDULE_SCHEMA = {
+    "name": "talk_message_schedule",
+    "description": (
+        "Schedule a Talk message to post later in this chat or thread, as you: for 'remind me "
+        "tomorrow at 9', follow-ups and check-ins. Talk posts it at that time and it notifies "
+        "the person like any message (silent=true to skip the notification). action=list shows "
+        "what is pending here, action=cancel removes one. Not available in federated rooms."
+        + _THREAD_ROOM_HINT),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message": {"type": "string", "description": "Text to post (required to schedule)."},
+            "when": {"type": "string",
+                     "description": ("When: 'in 2 hours', '30m', '1d', or an ISO date-time like "
+                                     "2026-11-02T09:00 (no zone means this host's local time).")},
+            "thread_id": {"type": "string", "description": "Thread to post in; empty means this turn's thread."},
+            "silent": {"type": "boolean", "description": "Post without a notification."},
+            "action": {"type": "string", "enum": ["schedule", "list", "cancel"]},
+            "scheduled_id": {"type": "string", "description": "For action=cancel."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
+        },
+    },
+}
+
+NEXTCLOUD_OCS_CALL_SCHEMA = {
+    "name": "nextcloud_ocs_call",
+    "description": (
+        "Read-only Nextcloud lookups as your own account, for what no other tool covers: someone's "
+        "status (away / do not disturb) via /ocs/v2.php/apps/user_status/api/v1/statuses/{user}, "
+        "a profile via /ocs/v2.php/cloud/users/{user}, unified search via "
+        "/ocs/v2.php/search/providers/{provider}/search with params term=..., room participants, "
+        "a message's context, thread lists, poll or reaction details, the server capabilities. "
+        "Also add or remove your own reaction on a message (POST/DELETE "
+        "/ocs/v2.php/apps/spreed/api/v1/reaction/{room}/{message} body {reaction}). Anything "
+        "else is refused."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "method": {"type": "string", "enum": ["GET", "POST", "DELETE"]},
+            "path": {"type": "string", "description": "Path starting /ocs/v2.php/ (no query string)."},
+            "params": {"type": "object", "description": "Query parameters."},
+            "body": {"type": "object", "description": "JSON body (reaction add/remove only)."},
+        },
+        "required": ["path"],
+    },
+}
+
+SERVER_TOOLS = (
+    ("talk_message_schedule", TALK_MESSAGE_SCHEDULE_SCHEMA, talk_message_schedule, "⏰"),
+    ("nextcloud_ocs_call", NEXTCLOUD_OCS_CALL_SCHEMA, nextcloud_ocs_call, "\U0001F50C"),
+)
+
+
 def register_tools(ctx) -> None:
     """Register the call tools (``nctalk-calls``, gated on NEXTCLOUD_TALK_CALL_TOOLS) and the
     thread tools (``nctalk-threads``, on in user mode unless NEXTCLOUD_TALK_THREAD_TOOLS=off)."""
@@ -808,5 +1444,11 @@ def register_tools(ctx) -> None:
     for name, schema, handler, emoji in THREAD_TOOLS:
         ctx.register_tool(name=name, toolset=THREAD_TOOLSET, schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji, check_fn=thread_tools_enabled)
+    for name, schema, handler, emoji in POLL_TOOLS:
+        ctx.register_tool(name=name, toolset=POLL_TOOLSET, schema=schema, handler=handler,
+                          description=schema["description"], emoji=emoji, check_fn=poll_tools_enabled)
+    for name, schema, handler, emoji in SERVER_TOOLS:
+        ctx.register_tool(name=name, toolset=CAPS_TOOLSET, schema=schema, handler=handler,
+                          description=schema["description"], emoji=emoji, check_fn=server_tools_enabled)
     # Harmless when the tools are off: check_fn drops them before tool_search sees them.
     pin_visible()

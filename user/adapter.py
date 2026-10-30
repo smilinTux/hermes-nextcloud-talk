@@ -102,6 +102,11 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+
+try:  # package import (plugin and tests both load ``user`` as a package)
+    from . import pollstate
+except ImportError:  # pragma: no cover - loaded as a loose module
+    import pollstate  # type: ignore
 # Platform id. Not ``nextcloud_talk``: another author's Talk plugin in the
 # Hermes catalog registers that id, and two plugins claiming one id silently
 # replace each other. Env var names keep the NEXTCLOUD_TALK_ prefix.
@@ -272,6 +277,43 @@ THREAD_HISTORY_SCAN = 100      # federated rooms: Talk does not proxy a thread-f
 NOTIFY_DEFAULT = 0             # Talk Participant::NOTIFY_* (thread follow levels)
 NOTIFY_NEVER = 3               # "unfollow"; the agent uses it on its own side to mark a thread closed
 CLOSED_MARK = "\u2705 "         # talk_thread_close prefixes a closed thread's title with this
+
+# Polls (tools.py talk_poll_*). The agent gets a turn when its poll is answered:
+# a native Talk poll after POLL_SETTLE seconds of quiet following a vote (Talk
+# hides votes from the author until closed, so the adapter closes it to read
+# them), a numbered reaction poll after a short settle. Any person's message in
+# the thread while a poll is open is their own answer ("fill in") and closes it.
+POLL_SETTLE_ENV = "NEXTCLOUD_TALK_POLL_SETTLE_SECONDS"
+DEFAULT_POLL_SETTLE = 15.0
+REACTION_POLL_SETTLE = 4.0
+REACTION_POLL_MULTI_SETTLE = 30.0
+POLLS_HINT = (
+    "To let the person choose between 2 to 4 real directions (which approach, what next), use "
+    "talk_poll_create with the top choices; it adds a 'something else, reply here' line, and you "
+    "get a new turn with their answer. A yes/no question is not a poll: ask it in one line and "
+    "they answer with a check mark or cross reaction, which reaches you as a turn."
+)
+# Reactions that give the agent a turn when a person puts them on one of its
+# messages: yes/no answers to a question, and "done" on a thread's last message.
+REACTION_TURNS_ENV = "NEXTCLOUD_TALK_REACTION_TURNS"
+DEFAULT_REACTION_TURNS = "✅,❌"  # check mark, cross
+YES_REACTIONS = frozenset({"✅", "\U0001F44D", "✔️", "✔"})
+# Server capabilities: re-read daily, told to the model once per conversation.
+CAPS_REFRESH_SECONDS = 24 * 3600.0
+CAPS_NOTE_ENV = "NEXTCLOUD_TALK_CAPABILITY_NOTE"
+CAPS_FEATURE_WORDS = (
+    ("threads", "threads"),
+    ("talk-polls", "polls"),
+    ("scheduled-messages", "scheduled messages (talk_message_schedule)"),
+    ("silent-send", "silent messages"),
+    ("reactions", "reactions"),
+    ("edit-messages", "message edits"),
+)
+CAPS_APP_WORDS = (
+    ("deck", "Deck"), ("calendar", "Calendar"), ("tables", "Tables"), ("forms", "Forms"),
+    ("polls", "Polls app"), ("richdocuments", "Office"), ("assistant", "Assistant"),
+    ("cookbook", "Cookbook"),
+)
 
 _DISPLAY_MODE_PREFIX_RE = re.compile(r"^\s*\[(mention|watch|free)\]", re.IGNORECASE)
 
@@ -614,6 +656,44 @@ def _resolve_file_placeholders(text: str, parameters: Optional[Dict[str, Any]]) 
     out = re.sub(r"\{(file[a-zA-Z0-9_-]*)\}", _sub, text)
     extra = [_describe_file(p) for key, p in sorted(named.items()) if key not in used]
     return " ".join([out] + extra).strip() if extra else out
+
+
+def _resolve_object_placeholders(text: str, parameters: Optional[Dict[str, Any]]) -> str:
+    """A shared poll (or other rich object) arrives as the bare text ``{object}``."""
+    obj = (parameters or {}).get("object")
+    if not isinstance(obj, dict) or "{object}" not in text:
+        return text
+    if obj.get("type") == "talk-poll":
+        label = f"[poll: {obj.get('name') or 'untitled'}]"
+    else:
+        label = f"[{obj.get('type') or 'object'}: {obj.get('name') or ''}]".replace(": ]", "]")
+    return text.replace("{object}", label)
+
+
+def _capability_note(features: List[str], apps: List[str], *, chat_type: str, federated: bool,
+                     host_features: Optional[List[str]] = None) -> str:
+    """One short block telling the model what this chat's servers can do."""
+    feats = set(host_features if federated and host_features is not None else features)
+    words = [w for key, w in CAPS_FEATURE_WORDS if key in feats]
+    if federated and "scheduled messages (talk_message_schedule)" in words:
+        words.remove("scheduled messages (talk_message_schedule)")  # the host refuses it (406)
+    lines = []
+    if words:
+        lines.append("Talk here supports: " + ", ".join(words) + ".")
+    if "talk-polls" in feats:
+        if chat_type == "dm":
+            lines.append("Talk has no polls in one-to-one chats, so talk_poll_create posts a "
+                         "numbered reaction poll here.")
+        elif federated:
+            lines.append("This room is hosted on another server: a poll inside a thread becomes a "
+                         "numbered reaction poll, and scheduled messages are not available.")
+    if apps:
+        lines.append("Your Nextcloud account also has: " + ", ".join(apps)
+                     + ". For lookups (someone's status, a profile, unified search) use "
+                       "nextcloud_ocs_call.")
+    if not lines:
+        return ""
+    return "[Server capabilities, told once per conversation] " + " ".join(lines)
 
 
 def _media_kind(mime: str, is_voice: bool) -> str:
@@ -1017,6 +1097,31 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             self._thread_resume_s: float = max(0.0, float(raw_resume)) * 3600.0
         except (TypeError, ValueError):
             self._thread_resume_s = DEFAULT_THREAD_RESUME_HOURS * 3600.0
+        # Polls: settle time after a vote, pending decide tasks (key -> task).
+        raw_settle = extra.get("poll_settle_seconds")
+        if raw_settle is None:
+            raw_settle = os.getenv(POLL_SETTLE_ENV, str(DEFAULT_POLL_SETTLE))
+        try:
+            self._poll_settle: float = max(0.0, float(raw_settle))
+        except (TypeError, ValueError):
+            self._poll_settle = DEFAULT_POLL_SETTLE
+        self._poll_tasks: Dict[str, asyncio.Task] = {}
+        raw_turns = extra.get("reaction_turns")
+        if raw_turns is None:
+            raw_turns = os.getenv(REACTION_TURNS_ENV, DEFAULT_REACTION_TURNS)
+        self._reaction_turns = frozenset(
+            e.strip().replace("\ufe0f", "") for e in str(raw_turns).split(",") if e.strip())
+        # Capabilities of our own server (features + apps), and per federated room
+        # the host's Talk features; the note goes out once per conversation key.
+        self._server_features: List[str] = []
+        self._server_apps: List[str] = []
+        self._caps_fetched_at: float = 0.0
+        self._room_host_features: Dict[str, Tuple[float, List[str]]] = {}
+        self._caps_note_given: set = set()
+        raw_note = extra.get("capability_note")
+        if raw_note is None:
+            raw_note = os.getenv(CAPS_NOTE_ENV, "on")
+        self._caps_note_on: bool = str(raw_note).strip().lower() not in ("0", "off", "false", "no")
 
     # -- Connection lifecycle -------------------------------------------
 
@@ -1047,6 +1152,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._running = False
         self._mark_disconnected()
 
+        for task in list(self._poll_tasks.values()):
+            task.cancel()
+        self._poll_tasks.clear()
         for task in list(self._room_tasks.values()):
             task.cancel()
         for task in (self._discovery_task, self._watch_flush_task):
@@ -1072,7 +1180,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         backoff_idx = 0
         while self._running:
             try:
-                if not self._capabilities_checked:
+                if (not self._capabilities_checked
+                        or time.time() - self._caps_fetched_at > CAPS_REFRESH_SECONDS):
                     await self._refresh_capabilities()
                 await self._discover_rooms()
                 await self._discover_invitations()
@@ -1109,6 +1218,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         features = (caps.get("spreed") or {}).get("features") or []
         self._threads_enabled = THREADS_CAPABILITY in features
         self._capabilities_checked = True
+        self._server_features = list(features)
+        self._server_apps = [word for key, word in CAPS_APP_WORDS if caps.get(key)]
+        self._caps_fetched_at = time.time()
         logger.info("[%s] Talk threads %s", self.name,
                     "enabled" if self._threads_enabled else "not supported by this server (off)")
 
@@ -1355,6 +1467,10 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # Someone joined or left: a pair room with a third person in it
             # must drop back to mention before that person's first message.
             await self._refresh_pair_room(token, force=True)
+        if message.get("systemMessage") in ("poll_voted", "poll_closed", "reaction"):
+            # A vote on, or a reaction to, something we asked: may be an answer.
+            await self._on_answer_signal(token, message)
+            return
         if message.get("messageType") not in (None, "comment", "voice-message"):
             # Skip system messages (join/leave/call events etc).
             return
@@ -1372,6 +1488,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # A thread root (ours included): remember who opened it and how.
             self._note_thread_root(token, thread_id, message, actor)
         if self._is_self(actor):
+            self._note_own_poll_message(token, message)
             return  # echo of our own send
 
         text = (message.get("message") or "").strip()
@@ -1413,6 +1530,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         )
         text = _resolve_mention_placeholders(text, message.get("messageParameters"))
         text = _resolve_file_placeholders(text, message.get("messageParameters"))
+        text = _resolve_object_placeholders(text, message.get("messageParameters"))
         shared_files = _file_parameters(message.get("messageParameters"))
         if mentioned:
             bare = _strip_leading_self_mention(text, self._username, self._display_name)
@@ -1527,6 +1645,11 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # Whoever creates a room writes its description; only rooms the
             # operator listed (or an explicit opt-in) may hand the agent rules.
             event.text = _with_room_rules(event.text, room.get("description"))
+        if not from_agent:
+            if thread_id or chat_type == "dm" or self._is_pair_room(token):
+                # Main-timeline chatter in a group room is not an answer to a poll.
+                event.text = await self._with_poll_fill_in(token, thread_id, event.text)
+        event.text = await self._with_capability_note(token, thread_id, chat_type, room, event.text)
         await self.handle_message(event)
 
     async def _attach_files(
@@ -1886,6 +2009,292 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return True
         self._seen_messages[msg_id] = now
         return False
+
+    # -- Polls, answer reactions, capability note -----------------------------
+
+    def _poll_store(self):
+        return pollstate.state_path(self._server, self._username)
+
+    def _is_person(self, actor: Dict[str, Optional[str]]) -> bool:
+        """A human allowed to steer us: not us, not another agent, on the allowlist."""
+        return (not self._is_self(actor) and not _is_agent_actor(actor, self._agent_users)
+                and self._sender_allowed(actor.get("id")))
+
+    def _note_own_poll_message(self, token: str, message: Dict[str, Any]) -> None:
+        """Our own native poll's chat message: keep its id so the answer turn replies to it."""
+        obj = (message.get("messageParameters") or {}).get("object") or {}
+        if obj.get("type") != "talk-poll":
+            return
+        try:
+            for rec in pollstate.find(self._poll_store(), room=token, kind="native",
+                                      poll_id=str(obj.get("id"))):
+                if not rec.get("message_id"):
+                    pollstate.update(self._poll_store(), rec["key"], message_id=str(message.get("id")))
+        except Exception as e:  # never cost a turn over bookkeeping
+            logger.debug("[%s] poll message note failed: %s", self.name, e)
+
+    def _schedule_poll_decide(self, key: str, coro_fn, delay: float) -> None:
+        task = self._poll_tasks.get(key)
+        if task and not task.done():
+            return  # one pending check re-reads everything when it fires
+        async def _run():
+            try:
+                await asyncio.sleep(delay)
+                await coro_fn()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("[%s] poll %s: %s", self.name, key, e)
+            finally:
+                self._poll_tasks.pop(key, None)
+        self._poll_tasks[key] = asyncio.create_task(_run())
+
+    async def _on_answer_signal(self, token: str, message: Dict[str, Any]) -> None:
+        msg_id = str(message.get("id", ""))
+        kind = message.get("systemMessage")
+        params = message.get("messageParameters") or {}
+        store = self._poll_store()
+        if kind in ("poll_voted", "poll_closed"):
+            pid = str((params.get("poll") or {}).get("id") or "")
+            if not pid:
+                return
+            recs = pollstate.find(store, room=token, kind="native", poll_id=pid)
+            if not recs:
+                return
+            actor = _extract_actor(message)
+            if kind == "poll_closed" and self._is_self(actor):
+                return  # we closed it (talk_poll_close or our own decide)
+            rec = recs[0]
+            delay = 0.0 if kind == "poll_closed" else self._poll_settle
+            self._schedule_poll_decide(rec["key"], lambda: self._decide_native(token, rec["key"]), delay)
+            return
+        # A reaction. Our own (working indicator, poll keycaps) and other agents' never count.
+        actor = _extract_actor(message)
+        if not self._is_person(actor):
+            return
+        emoji = (message.get("message") or "").strip()
+        parent = message.get("parent") or {}
+        parent_id = str(parent.get("id") or "")
+        if not parent_id:
+            return
+        if pollstate.keycap_index(emoji) is not None:
+            recs = pollstate.find(store, room=token, kind="reaction", message_id=parent_id)
+            if recs:
+                rec = recs[0]
+                delay = REACTION_POLL_MULTI_SETTLE if rec.get("multi") else REACTION_POLL_SETTLE
+                self._schedule_poll_decide(
+                    rec["key"], lambda: self._decide_reaction(token, rec["key"]), delay)
+                return
+        bare = emoji.replace("️", "")
+        if bare not in self._reaction_turns:
+            return
+        if not self._is_self(_extract_actor(parent)):
+            return  # a reaction on someone else's message is not an answer to us
+        await self._dispatch_reaction_turn(token, message, parent, actor, emoji, msg_id)
+
+    def _event_for(self, token: str, actor: Dict[str, Optional[str]], text: str,
+                   message_id: Optional[str], thread_id: Optional[str]) -> MessageEvent:
+        room = self._room_meta.get(token, {})
+        source = self.build_source(
+            chat_id=token,
+            chat_name=room.get("displayName") or room.get("name"),
+            chat_type=_room_chat_type(room.get("type")),
+            user_id=actor.get("id"),
+            user_name=actor.get("display_name"),
+            message_id=message_id,
+            thread_id=thread_id or None,
+        )
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source,
+                             message_id=message_id, raw_message={},
+                             timestamp=datetime.now(timezone.utc))
+        self._apply_role_prompt(event)
+        return event
+
+    async def _dispatch_reaction_turn(self, token: str, message: Dict[str, Any], parent: Dict[str, Any],
+                                      actor: Dict[str, Optional[str]], emoji: str, msg_id: str) -> None:
+        thread_id = ((_message_thread_id(message) or _message_thread_id(parent))
+                     if self._threads_enabled else None)
+        snippet = " ".join(_resolve_mention_placeholders(
+            str(parent.get("message") or ""), parent.get("messageParameters")).split())[:300]
+        who = actor.get("display_name") or actor.get("id") or "They"
+        yes = emoji.replace("️", "") in {e.replace("️", "") for e in YES_REACTIONS}
+        if yes:
+            meaning = ("If that message asked a yes/no question or for approval, this is YES: go "
+                       "ahead now. If it did not ask anything"
+                       + (" and this is a thread, it means this matter is done: close the thread "
+                          "(talk_thread_close) with a one-line result." if thread_id else
+                          ", treat it as an acknowledgement and reply only if something is due."))
+        else:
+            meaning = ("If that message asked a yes/no question or for approval, this is NO: do not "
+                       "do it, and ask in one line what they want instead if that is unclear. "
+                       "Otherwise they disagree with it: ask briefly what to change.")
+        text = f"[Reaction] {who} reacted {emoji} to your message: \"{snippet}\". {meaning}"
+        event = self._event_for(token, actor, text, str(parent.get("id") or msg_id), thread_id)
+        await self.handle_message(event)
+
+    async def _decide_native(self, token: str, key: str) -> None:
+        store = self._poll_store()
+        rec = pollstate.get(store, key)
+        if not rec or rec.get("status") != "open" or self._http_client is None:
+            return
+        base = f"/ocs/v2.php/apps/spreed/api/v1/poll/{token}/{rec['poll_id']}"
+        resp = await self._http_client.get(base, params={"format": "json"})
+        data = resp.json().get("ocs", {}).get("data") if resp.status_code == 200 else None
+        if not isinstance(data, dict):
+            return
+        if data.get("status") != 1:
+            if int(data.get("numVoters") or 0) < int(rec.get("wait_for") or 1):
+                return
+            # Talk shows the author the votes only once the poll is closed.
+            resp = await self._http_client.delete(base, params={"format": "json"})
+            data = resp.json().get("ocs", {}).get("data") if resp.status_code == 200 else None
+            if not isinstance(data, dict):
+                return
+        options = data.get("options") or rec.get("options") or []
+        picks: Dict[str, List[str]] = {}
+        first_actor: Optional[Dict[str, Optional[str]]] = None
+        for d in data.get("details") or []:
+            voter = {"id": d.get("actorId"), "display_name": d.get("actorDisplayName"),
+                     "type": d.get("actorType")}
+            if not self._is_person(voter):
+                continue
+            try:
+                label = options[int(d.get("optionId"))]
+            except (TypeError, ValueError, IndexError):
+                continue
+            picks.setdefault(label, []).append(voter.get("display_name") or voter.get("id"))
+            first_actor = first_actor or voter
+        if not picks or first_actor is None:
+            pollstate.claim(store, key, "closed")
+            return
+        claimed = pollstate.claim(store, key, "decided", result=picks)
+        if claimed:
+            await self._dispatch_poll_answer(token, claimed, picks, first_actor)
+
+    async def _decide_reaction(self, token: str, key: str) -> None:
+        store = self._poll_store()
+        rec = pollstate.get(store, key)
+        if not rec or rec.get("status") != "open" or self._http_client is None:
+            return
+        resp = await self._http_client.get(
+            f"/ocs/v2.php/apps/spreed/api/v1/reaction/{token}/{rec['message_id']}",
+            params={"format": "json"})
+        data = resp.json().get("ocs", {}).get("data") if resp.status_code == 200 else None
+        if not isinstance(data, dict):
+            return
+        options = rec.get("options") or []
+        picks: Dict[str, List[str]] = {}
+        voters: Dict[str, Dict[str, Optional[str]]] = {}
+        for emoji, people in data.items():
+            idx = pollstate.keycap_index(emoji)
+            if idx is None or idx >= len(options):
+                continue
+            for p in people or []:
+                voter = {"id": p.get("actorId"), "display_name": p.get("actorDisplayName"),
+                         "type": p.get("actorType")}
+                if not self._is_person(voter):
+                    continue
+                picks.setdefault(options[idx], []).append(voter.get("display_name") or voter.get("id"))
+                voters.setdefault(str(voter.get("id")), voter)
+        if len(voters) < int(rec.get("wait_for") or 1):
+            return
+        claimed = pollstate.claim(store, key, "decided", result=picks)
+        if not claimed:
+            return
+        await self._mark_reaction_poll(token, rec, picks)
+        await self._dispatch_poll_answer(token, claimed, picks, next(iter(voters.values())))
+
+    async def _mark_reaction_poll(self, token: str, rec: Dict[str, Any], picks: Dict[str, List[str]]) -> None:
+        """Best effort: edit the poll message so it reads as answered."""
+        if self._http_client is None or not rec.get("message_id"):
+            return
+        mark = " / ".join(picks) if picks else "answered in the thread"
+        text = (f"\U0001F4CA **{rec.get('question')}**\n\n"
+                f"✅ Answered: {mark}")
+        try:
+            await self._http_client.put(
+                f"/ocs/v2.php/apps/spreed/api/v1/chat/{token}/{rec['message_id']}",
+                params={"format": "json"}, json={"message": text})
+        except Exception as e:
+            logger.debug("[%s] reaction poll edit failed: %s", self.name, e)
+
+    async def _dispatch_poll_answer(self, token: str, rec: Dict[str, Any], picks: Dict[str, List[str]],
+                                    actor: Dict[str, Optional[str]]) -> None:
+        who = actor.get("display_name") or actor.get("id") or "They"
+        chosen = "; ".join(f"{label} ({', '.join(names)})" for label, names in picks.items())
+        fill_in = any(label == pollstate.FILL_IN_LABEL for label in picks)
+        text = (f"[Poll answer] Your poll \"{rec.get('question')}\" was answered: {chosen}. "
+                f"Options were: {', '.join(rec.get('options') or [])}. ")
+        if fill_in:
+            text += ("They picked 'something else': if they have not written what they want in this "
+                     "thread yet, ask for it in one short line.")
+        else:
+            text += f"{who}'s choice decides it: act on it now, in this thread."
+        event = self._event_for(token, actor, text, rec.get("message_id"), rec.get("thread") or None)
+        logger.info("[%s] poll %s answered in %s: %s", self.name, rec.get("key"), token, chosen)
+        await self.handle_message(event)
+
+    async def _with_poll_fill_in(self, token: str, thread_id: Optional[str], text: str) -> str:
+        """A person writing in a thread (or main timeline) with our poll open: their own answer."""
+        store = self._poll_store()
+        try:
+            recs = pollstate.find(store, room=token, thread=thread_id or "")
+        except Exception as e:
+            logger.debug("[%s] poll lookup failed: %s", self.name, e)
+            return text
+        if not recs:
+            return text
+        rec = pollstate.claim(store, recs[0]["key"], "answered")
+        if not rec:
+            return text
+        task = self._poll_tasks.pop(rec["key"], None)
+        if task:
+            task.cancel()
+        if self._http_client is not None:
+            try:
+                if rec.get("kind") == "native":
+                    await self._http_client.delete(
+                        f"/ocs/v2.php/apps/spreed/api/v1/poll/{token}/{rec['poll_id']}",
+                        params={"format": "json"})
+                else:
+                    await self._mark_reaction_poll(token, rec, {})
+            except Exception as e:
+                logger.debug("[%s] poll close on fill-in failed: %s", self.name, e)
+        return (f"[Your poll \"{rec.get('question')}\" was open here and they wrote this instead of "
+                "picking an option: treat it as their answer if it is one (the poll is closed "
+                "now).]\n\n" + text)
+
+    async def _room_host_caps(self, token: str) -> Optional[List[str]]:
+        cached = self._room_host_features.get(token)
+        if cached and time.time() - cached[0] < CAPS_REFRESH_SECONDS:
+            return cached[1]
+        if self._http_client is None:
+            return None
+        try:
+            resp = await self._http_client.get(
+                f"/ocs/v2.php/apps/spreed/api/v4/room/{token}/capabilities", params={"format": "json"})
+            data = resp.json().get("ocs", {}).get("data") if resp.status_code == 200 else None
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        feats = list(data.get("features") or [])
+        self._room_host_features[token] = (time.time(), feats)
+        return feats
+
+    async def _with_capability_note(self, token: str, thread_id: Optional[str], chat_type: str,
+                                    room: Dict[str, Any], text: str) -> str:
+        if not self._caps_note_on or not self._server_features:
+            return text
+        key = _ctx_key(token, thread_id)
+        if key in self._caps_note_given:
+            return text
+        federated = bool(room.get("remoteServer"))
+        host = await self._room_host_caps(token) if federated else None
+        note = _capability_note(self._server_features, self._server_apps, chat_type=chat_type,
+                                federated=federated, host_features=host)
+        self._caps_note_given.add(key)
+        return f"{note}\n\n{text}" if note else text
 
     # -- Watch-mode digest --------------------------------------------------
 
@@ -2397,6 +2806,6 @@ def register(ctx) -> None:
             "(bold/italic/inline code) and @mentions use Talk's "
             '@"Display Name" syntax for names with spaces. Keep '
             "responses concise -- up to 32000 characters per message, "
-            "longer replies are sent as multiple messages. " + THREADS_HINT
+            "longer replies are sent as multiple messages. " + THREADS_HINT + " " + POLLS_HINT
         ),
     )

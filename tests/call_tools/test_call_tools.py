@@ -196,7 +196,13 @@ def test_register_tools_gated():
     assert [k["name"] for k in calls] == ["call_join", "call_leave", "call_status"]
     assert [k["name"] for k in threads] == ["talk_thread_start", "talk_thread_reply",
                                              "talk_thread_list", "talk_thread_close"]
-    assert len(seen) == 7
+    polls = [k for k in seen if k["toolset"] == "nctalk-polls"]
+    server = [k for k in seen if k["toolset"] == "nctalk-server"]
+    assert [k["name"] for k in polls] == ["talk_poll_create", "talk_poll_status", "talk_poll_close"]
+    assert [k["name"] for k in server] == ["talk_message_schedule", "nextcloud_ocs_call"]
+    assert len(seen) == 12
+    assert all(k["check_fn"] is ct.poll_tools_enabled for k in polls)
+    assert all(k["check_fn"] is ct.server_tools_enabled for k in server)
     assert all(k["check_fn"] is ct.tools_enabled for k in calls)
     assert all(k["check_fn"] is ct.thread_tools_enabled for k in threads)
     for k in calls:
@@ -206,7 +212,7 @@ def test_register_tools_gated():
 
 
 def test_descriptions_have_no_long_dashes():
-    for _, schema, _, _ in ct.TOOLS + ct.THREAD_TOOLS:
+    for _, schema, _, _ in ct.TOOLS + ct.THREAD_TOOLS + ct.POLL_TOOLS + ct.SERVER_TOOLS:
         assert "\u2014" not in json.dumps(schema, ensure_ascii=False)
         assert "\u2013" not in json.dumps(schema, ensure_ascii=False)
 
@@ -227,7 +233,7 @@ def test_pin_visible_adds_toolset_to_direct_surface(monkeypatch):
     mod = _fake_tool_search(monkeypatch)
     assert ct.pin_visible() is True
     assert mod._DIRECT_SURFACE_TOOLSETS == frozenset(
-        {"project", "desktop_ui", "nctalk-calls", "nctalk-threads"})
+        {"project", "desktop_ui", "nctalk-calls", "nctalk-threads", "nctalk-polls", "nctalk-server"})
     assert isinstance(mod._DIRECT_SURFACE_TOOLSETS, frozenset)
 
 

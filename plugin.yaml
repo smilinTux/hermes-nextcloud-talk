@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.10.2
+version: 1.11.0
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -22,6 +22,11 @@ provides_tools:
   - talk_thread_reply
   - talk_thread_list
   - talk_thread_close
+  - talk_poll_create
+  - talk_poll_status
+  - talk_poll_close
+  - talk_message_schedule
+  - nextcloud_ocs_call
 requires_env: []
 optional_env:
   # -- Bot mode --
@@ -172,6 +177,42 @@ optional_env:
       User mode: 'off' hides the talk_thread_start / talk_thread_reply tools
       (default on when the user-mode credentials are set)
     prompt: "Thread tools (user mode, on/off, default on)"
+    password: false
+  - name: NEXTCLOUD_TALK_POLL_TOOLS
+    description: >-
+      User mode: 'off' hides talk_poll_create / talk_poll_status / talk_poll_close
+      (default on). A native Talk poll where Talk allows one, a numbered
+      reaction poll in one-to-one chats and in threads of federated rooms.
+    prompt: "Poll tools (user mode, on/off, default on)"
+    password: false
+  - name: NEXTCLOUD_TALK_POLL_SETTLE_SECONDS
+    description: >-
+      User mode: seconds after a vote on the agent's Talk poll before it reads
+      the result and takes its turn (default 15; lets a person change their vote)
+    prompt: "Poll settle seconds (default 15)"
+    password: false
+  - name: NEXTCLOUD_TALK_REACTION_TURNS
+    description: >-
+      User mode: comma-separated reactions that give the agent a turn when a
+      person puts them on one of its messages (default check mark and cross:
+      yes/no answers, and "done" on a thread's last message). Empty disables.
+    prompt: "Reactions that answer the agent (default check mark, cross)"
+    password: false
+  - name: NEXTCLOUD_TALK_SERVER_TOOLS
+    description: >-
+      User mode: 'off' hides talk_message_schedule and nextcloud_ocs_call
+      (default on)
+    prompt: "Server tools (user mode, on/off, default on)"
+    password: false
+  - name: NEXTCLOUD_TALK_CAPABILITY_NOTE
+    description: >-
+      User mode: 'off' stops the once-per-conversation note telling the model
+      what the chat's Talk server and the agent's Nextcloud can do (default on)
+    prompt: "Capability note (user mode, on/off, default on)"
+    password: false
+  - name: NEXTCLOUD_TALK_STATE_DIR
+    description: "User mode: where open polls are kept (default $HERMES_HOME/nctalk)"
+    prompt: "State directory (default $HERMES_HOME/nctalk)"
     password: false
   # -- Call tools (opt-in) --
   - name: NEXTCLOUD_TALK_CALL_TOOLS
