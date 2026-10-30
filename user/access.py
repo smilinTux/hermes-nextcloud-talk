@@ -62,12 +62,15 @@ def _ids(raw: Any) -> List[str]:
 def parse(text: str) -> Dict[str, Any]:
     """Parse the file body (YAML when PyYAML is present, else JSON) into a normalized dict."""
     data: Any = None
-    try:
-        import yaml  # type: ignore
-
-        data = yaml.safe_load(text)
-    except ImportError:
+    if text.lstrip().startswith("{"):
         data = json.loads(text)
+    else:
+        try:
+            import yaml  # type: ignore
+        except ImportError:  # not every Hermes runtime ships PyYAML
+            data = _mini_yaml(text)
+        else:
+            data = yaml.safe_load(text)
     if data is None:
         data = {}
     if not isinstance(data, dict):
@@ -77,6 +80,85 @@ def parse(text: str) -> Dict[str, Any]:
         spec = spec if isinstance(spec, dict) else {"users": spec}
         rooms[str(token)] = {"users": _ids(spec.get("users")), "only": bool(spec.get("only"))}
     return {"users": _ids(data.get("users")), "agents": _ids(data.get("agents")), "rooms": rooms}
+
+
+def _scalar(raw: str) -> Any:
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1]
+    low = raw.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    if low in ("", "null", "~"):
+        return None
+    return raw
+
+
+def _flow(raw: str) -> Any:
+    """``[a, b]`` / ``{users: [a], only: true}`` / a scalar."""
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        return [_scalar(x) for x in raw[1:-1].split(",") if x.strip()]
+    if raw.startswith("{") and raw.endswith("}"):
+        out: Dict[str, Any] = {}
+        body, depth, cur, parts = raw[1:-1], 0, "", []
+        for ch in body:
+            depth += ch == "["
+            depth -= ch == "]"
+            if ch == "," and depth == 0:
+                parts.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        parts.append(cur)
+        for part in parts:
+            if ":" in part:
+                k, v = part.split(":", 1)
+                out[k.strip()] = _flow(v)
+        return out
+    return _scalar(raw)
+
+
+def _mini_yaml(text: str) -> Dict[str, Any]:
+    """The subset of YAML this file uses (block or flow lists, nested room mappings,
+    ``#`` comments), for runtimes without PyYAML. Anything else raises ValueError."""
+    lines = []
+    for raw in text.splitlines():
+        line = raw.split(" #", 1)[0].rstrip() if not raw.lstrip().startswith("#") else ""
+        if line.strip():
+            lines.append((len(line) - len(line.lstrip()), line.strip()))
+
+    def block(i: int, indent: int):
+        if i < len(lines) and lines[i][1].startswith("- "):
+            items = []
+            while i < len(lines) and lines[i][0] == indent and lines[i][1].startswith("- "):
+                items.append(_scalar(lines[i][1][2:]))
+                i += 1
+            return items, i
+        out: Dict[str, Any] = {}
+        while i < len(lines) and lines[i][0] == indent:
+            key, sep, rest = lines[i][1].partition(":")
+            if not sep:
+                raise ValueError(f"cannot parse line: {lines[i][1]!r}")
+            i += 1
+            if rest.strip():
+                out[key.strip()] = _flow(rest)
+            elif i < len(lines) and lines[i][0] > indent:
+                out[key.strip()], i = block(i, lines[i][0])
+            elif i < len(lines) and lines[i][0] == indent and lines[i][1].startswith("- "):
+                out[key.strip()], i = block(i, indent)
+            else:
+                out[key.strip()] = None
+        return out, i
+
+    if not lines:
+        return {}
+    data, i = block(0, lines[0][0])
+    if i != len(lines):
+        raise ValueError(f"cannot parse line: {lines[i][1]!r}")
+    return data
 
 
 class TalkAccess:

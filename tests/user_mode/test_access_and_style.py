@@ -217,3 +217,43 @@ def test_send_and_edit_strip_dashes(tmp_path, monkeypatch):
     asyncio.run(a.send("room1", "Done — shipped 1–2 fixes"))
     asyncio.run(a.edit_message("room1", "7", "Edited — again"))
     assert sent == ["Done, shipped 1-2 fixes", "Edited, again"]
+
+
+def test_mini_yaml_matches_the_documented_shapes():
+    text = """
+# comment
+users:
+  - dknestri        # Chef
+  - mrarch@skhub.nativeassetmanagement.com
+agents: [jarvis@skhub.nativeassetmanagement.com, lumina@x.example]
+rooms:
+  abc1:
+    users: [carol]
+    only: true
+  abc2: {users: [dave, erin], only: false}
+"""
+    data = access._mini_yaml(text)
+    assert data == {"users": ["dknestri", "mrarch@skhub.nativeassetmanagement.com"],
+                    "agents": ["jarvis@skhub.nativeassetmanagement.com", "lumina@x.example"],
+                    "rooms": {"abc1": {"users": ["carol"], "only": True},
+                              "abc2": {"users": ["dave", "erin"], "only": False}}}
+    try:
+        import yaml
+    except ImportError:
+        return
+    assert yaml.safe_load(text) == data
+
+
+def test_without_pyyaml_the_file_still_loads(tmp_path, monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def no_yaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("no yaml")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_yaml)
+    a = _adapter(tmp_path, monkeypatch, FILE)
+    assert a._access.source == "file"
+    assert a._sender_allowed("guest1", "side1") and not a._sender_allowed("chef", "only1")
