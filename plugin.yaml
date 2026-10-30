@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.9.2
+version: 1.10.0
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -20,6 +20,8 @@ provides_tools:
   - call_status
   - talk_thread_start
   - talk_thread_reply
+  - talk_thread_list
+  - talk_thread_close
 requires_env: []
 optional_env:
   # -- Bot mode --
@@ -148,6 +150,13 @@ optional_env:
       as context with the next message this account does answer
       (default 40; 0 disables active listening).
     prompt: "Context backlog size (user mode, default 40, 0 disables)"
+    password: false
+  - name: NEXTCLOUD_TALK_THREAD_RESUME_HOURS
+    description: >-
+      User mode: a Talk thread quiet for at least this many hours gets its
+      recent lines (allowed senders and this account only) and a one-line
+      recap request added to the next turn in it (default 6, 0 turns it off).
+    prompt: "Hours of thread silence before a resume recap (default 6, 0 off)"
     password: false
   - name: NEXTCLOUD_TALK_THREAD_OWNERSHIP
     description: >-

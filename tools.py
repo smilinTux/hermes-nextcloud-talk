@@ -24,8 +24,12 @@ in nor's federated Operators AI (m4jyfpxq) start
 Thread tools (toolset ``nctalk-threads``, on by default in user mode, off with
 ``NEXTCLOUD_TALK_THREAD_TOOLS=off``): ``talk_thread_start`` opens a Talk
 thread (Talk 22+, capability ``threads``) with a title and a first message and
-returns its id; ``talk_thread_reply`` posts into an existing thread. They post
-as the agent's own Nextcloud account (user mode credentials), never a bot.
+returns its id; ``talk_thread_reply`` posts into an existing thread;
+``talk_thread_list`` lists a room's open threads; ``talk_thread_close`` puts a
+finished thread away (the agent's own follow level set to "never", a check mark
+on the title). They work the same in group rooms, direct messages and federated
+rooms; support is checked per room, on the server hosting it. They post as the
+agent's own Nextcloud account (user mode credentials), never a bot.
 
 Kept import-light (stdlib only, no gateway imports at module level) so the
 Hermes loader can pre-register these tools in CLI/TUI processes.
@@ -435,9 +439,17 @@ THREAD_TITLE_MAX = 200
 THREAD_MESSAGE_MAX = 32000
 CAPS_TTL_SECONDS = 600.0
 _CHAT_PATH = "/ocs/v2.php/apps/spreed/api/v1/chat/{room}"
+_THREAD_PATH = "/ocs/v2.php/apps/spreed/api/v1/chat/{room}/threads/{thread}"
+_RECENT_PATH = "/ocs/v2.php/apps/spreed/api/v1/chat/{room}/threads/recent"
+_ROOM_CAPS_PATH = "/ocs/v2.php/apps/spreed/api/v4/room/{room}/capabilities"
+NOTIFY_DEFAULT = 0   # Talk Participant::NOTIFY_* thread follow levels
+NOTIFY_NEVER = 3     # "unfollow"; on the agent's own side it marks a thread closed
+CLOSED_MARK = "\u2705 "  # check mark prefix on a closed thread's title
+THREAD_LIST_MAX = 50
 
 # (server, checked at, has threads); swappable in tests together with _http_post/_http_get.
 _caps_cache: dict = {}
+_room_caps_cache: dict = {}
 
 
 def _talk_credentials() -> tuple[str, str, str]:
@@ -455,14 +467,15 @@ def thread_tools_enabled() -> bool:
     return bool(server and password)
 
 
-def _ocs(method: str, path: str, *, json_body: Optional[dict] = None) -> tuple[int, Any]:
+def _ocs(method: str, path: str, *, json_body: Optional[dict] = None,
+         params: Optional[dict] = None) -> tuple[int, Any]:
     """One OCS request as the agent's account: (status, parsed ocs.data or text)."""
     import httpx  # Hermes dependency; imported lazily to keep this module stdlib-only at import
 
     server, user, password = _talk_credentials()
     headers = {"OCS-APIRequest": "true", "Accept": "application/json"}
     with httpx.Client(base_url=server, auth=(user, password), headers=headers, timeout=20.0) as client:
-        resp = client.request(method, path, params={"format": "json"}, json=json_body)
+        resp = client.request(method, path, params={**(params or {}), "format": "json"}, json=json_body)
     try:
         data = resp.json().get("ocs", {}).get("data")
     except Exception:
@@ -487,6 +500,61 @@ def server_has_threads() -> bool:
     has = "threads" in features
     _caps_cache[server] = (time.time(), has)
     return has
+
+
+def room_has_threads(room: str) -> bool:
+    """Threads in this room: our server must have them, and for a federated room the
+    HOST server too. ``/room/{token}/capabilities`` answers for the host (proxied) and
+    for a local room it is our own list. Cached per room; a failed read is not cached."""
+    import time
+
+    if not server_has_threads():
+        return False
+    cached = _room_caps_cache.get(room)
+    if cached and time.time() - cached[0] < CAPS_TTL_SECONDS:
+        return cached[1]
+    status, data = _request("GET", _ROOM_CAPS_PATH.format(room=room))
+    if status >= 300 or not isinstance(data, dict):
+        return False
+    has = "threads" in (data.get("features") or [])
+    _room_caps_cache[room] = (time.time(), has)
+    return has
+
+
+_NO_THREADS = "threads are not available in this room (needs Talk 22+ on the server hosting it)"
+
+
+def _thread_state(room: str, thread: str) -> tuple[Optional[dict], Optional[str]]:
+    """(thread info, error) from GET threads/{id}; info carries title and our follow level."""
+    try:
+        status, data = _request("GET", _THREAD_PATH.format(room=room, thread=thread))
+    except Exception as e:
+        return None, f"thread read failed: {e}"
+    if status >= 300 or not isinstance(data, dict):
+        return None, f"thread {thread} not found in this room (HTTP {status})"
+    return data, None
+
+
+def _is_closed(info: Optional[dict]) -> bool:
+    return ((info or {}).get("attendee") or {}).get("notificationLevel") == NOTIFY_NEVER
+
+
+def _set_level(room: str, thread: str, level: int) -> Optional[str]:
+    try:
+        status, data = _request("POST", _THREAD_PATH.format(room=room, thread=thread) + "/notify",
+                                json_body={"level": level})
+    except Exception as e:
+        return f"follow level change failed: {e}"
+    return None if status < 300 else f"HTTP {status}: {str(data)[:200]}"
+
+
+def _rename(room: str, thread: str, title: str) -> Optional[str]:
+    try:
+        status, data = _request("PUT", _THREAD_PATH.format(room=room, thread=thread),
+                                json_body={"threadTitle": title[:THREAD_TITLE_MAX]})
+    except Exception as e:
+        return f"rename failed: {e}"
+    return None if status < 300 else f"HTTP {status}"
 
 
 def current_thread() -> str:
@@ -524,8 +592,8 @@ def talk_thread_start(args: dict, **_kw: Any) -> str:
     room, err, note = _resolve_room(args)
     if err:
         return _result(error=err)
-    if not server_has_threads():
-        return _result(error="this Nextcloud Talk server does not support threads (needs Talk 22+)")
+    if not room_has_threads(room):
+        return _result(error=_NO_THREADS)
     mid, err = _post_chat(room, {"message": message, "threadTitle": title})
     if err:
         return _result(error=f"could not start the thread: {err}")
@@ -549,22 +617,105 @@ def talk_thread_reply(args: dict, **_kw: Any) -> str:
     thread = explicit or (current_thread() if room == current_room() else "")
     if not thread.isdigit() or int(thread) <= 0:
         return _result(error="thread_id is required: the id talk_thread_start returned (a message id)")
-    if not server_has_threads():
-        return _result(error="this Nextcloud Talk server does not support threads (needs Talk 22+)")
+    if not room_has_threads(room):
+        return _result(error=_NO_THREADS)
+    reopened = False
+    if room != current_room() or thread != current_thread():
+        # Posting unprompted (not answering inside this thread): a closed thread stays
+        # quiet unless reopen is asked for. A person writing in it reopens it on its own.
+        info, _err = _thread_state(room, thread)
+        if _is_closed(info):
+            if not _truthy(args.get("reopen")):
+                return _result(error=(f"thread {thread} is closed; pass reopen=true only if the person "
+                                      "asked to pick it back up"))
+            _set_level(room, thread, NOTIFY_DEFAULT)
+            title = ((info or {}).get("thread") or {}).get("title") or ""
+            if title.startswith(CLOSED_MARK):
+                _rename(room, thread, title[len(CLOSED_MARK):])
+            reopened = True
     mid, err = _post_chat(room, {"message": message, "threadId": int(thread)})
     if err:
         return _result(error=f"could not post into thread {thread}: {err}")
-    return _result(**_with_note({"status": "posted", "room": room, "thread_id": thread,
-                                 "message_id": mid}, note))
+    out = {"status": "posted", "room": room, "thread_id": thread, "message_id": mid}
+    if reopened:
+        out["reopened"] = True
+    return _result(**_with_note(out, note))
+
+
+def talk_thread_list(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    room, err, note = _resolve_room(args)
+    if err:
+        return _result(error=err)
+    if not room_has_threads(room):
+        return _result(error=_NO_THREADS)
+    try:
+        limit = max(1, min(THREAD_LIST_MAX, int(args.get("limit") or 20)))
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        status, data = _request("GET", _RECENT_PATH.format(room=room), params={"limit": limit})
+    except Exception as e:
+        return _result(error=f"could not list threads: {e}")
+    if status >= 300 or not isinstance(data, list):
+        return _result(error=f"could not list threads: HTTP {status}")
+    include_closed = _truthy(args.get("include_closed"))
+    threads = []
+    for item in data:
+        t = (item or {}).get("thread") or {}
+        closed = _is_closed(item)
+        if closed and not include_closed:
+            continue
+        threads.append({
+            "thread_id": str(t.get("id")),
+            "title": t.get("title") or "",
+            "replies": t.get("numReplies") or 0,
+            "last_activity": t.get("lastActivity"),
+            "closed": closed,
+        })
+    return _result(**_with_note({"room": room, "threads": threads}, note))
+
+
+def talk_thread_close(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    room, err, note = _resolve_room(args)
+    if err:
+        return _result(error=err)
+    explicit = str(args.get("thread_id") or "").strip()
+    thread = explicit or (current_thread() if room == current_room() else "")
+    if not thread.isdigit() or int(thread) <= 0:
+        return _result(error="thread_id is required (empty means the thread this chat turn came from)")
+    if not room_has_threads(room):
+        return _result(error=_NO_THREADS)
+    info, err = _thread_state(room, thread)
+    if err:
+        return _result(error=err)
+    summary = str(args.get("summary") or "").strip()[:THREAD_MESSAGE_MAX]
+    if summary:
+        _mid, perr = _post_chat(room, {"message": summary, "threadId": int(thread)})
+        if perr:
+            return _result(error=f"could not post the closing line: {perr}")
+    lerr = _set_level(room, thread, NOTIFY_NEVER)
+    if lerr:
+        return _result(error=f"could not close thread {thread}: {lerr}")
+    title = ((info or {}).get("thread") or {}).get("title") or ""
+    renamed = False
+    if title and not title.startswith(CLOSED_MARK):
+        # Only the thread's starter or a moderator may rename: in someone else's
+        # thread in a group room this fails and the close still stands.
+        renamed = _rename(room, thread, CLOSED_MARK + title) is None
+    return _result(**_with_note({"status": "closed", "room": room, "thread_id": thread,
+                                 "title_marked": renamed}, note))
 
 
 TALK_THREAD_START_SCHEMA = {
     "name": "talk_thread_start",
     "description": (
-        "Open a new Nextcloud Talk thread in a group room: a titled side conversation "
-        "for one task, so the work does not fill the main timeline. Posts the first "
-        "message as you and returns thread_id. Use it when you take on a task asked in "
-        "the main timeline; inside an existing thread just reply normally." + _THREAD_ROOM_HINT),
+        "Open a new Nextcloud Talk thread in this room or direct message: a titled side "
+        "conversation for one task or matter, so the work does not fill the main timeline. "
+        "Posts the first message as you and returns thread_id. Use it when you take on a "
+        "task, or a new separate matter comes up in a direct message; inside an existing "
+        "thread just reply normally." + _THREAD_ROOM_HINT),
     "parameters": {
         "type": "object",
         "properties": {
@@ -592,6 +743,9 @@ TALK_THREAD_REPLY_SCHEMA = {
                                           "talk_thread_start). Empty means the thread this chat "
                                           "turn came from.")},
             "message": {"type": "string", "description": "Message text (required)."},
+            "reopen": {"type": "boolean",
+                       "description": ("Post into a thread you closed, reopening it. Only when the "
+                                       "person asked to pick that matter back up.")},
             "room": _ROOM_PROP,
             OVERRIDE_ARG: _OTHER_ROOM_PROP,
         },
@@ -599,9 +753,49 @@ TALK_THREAD_REPLY_SCHEMA = {
     },
 }
 
+TALK_THREAD_LIST_SCHEMA = {
+    "name": "talk_thread_list",
+    "description": (
+        "List the open Nextcloud Talk threads in this room or direct message, most recently "
+        "active first: thread_id, title, reply count, last activity (unix time). Use it when "
+        "asked what is open or in progress here, or to find a matter's thread before "
+        "posting into it." + _THREAD_ROOM_HINT),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "How many threads (default 20, max 50)."},
+            "include_closed": {"type": "boolean", "description": "Also list threads you closed."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
+        },
+    },
+}
+
+TALK_THREAD_CLOSE_SCHEMA = {
+    "name": "talk_thread_close",
+    "description": (
+        "Close a Nextcloud Talk thread when its matter is finished or the person says it is "
+        "done: optionally posts a one-line summary into it, marks its title with a check mark "
+        "and stops you posting into it unprompted. Talk has no real close, and you cannot see "
+        "whether the person unfollowed it, so this is how a thread is put away. If they write "
+        "in it again it reopens by itself." + _THREAD_ROOM_HINT),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "thread_id": {"type": "string",
+                          "description": "Thread id; empty means the thread this chat turn came from."},
+            "summary": {"type": "string", "description": "Optional one-line result to post first."},
+            "room": _ROOM_PROP,
+            OVERRIDE_ARG: _OTHER_ROOM_PROP,
+        },
+    },
+}
+
 THREAD_TOOLS = (
     ("talk_thread_start", TALK_THREAD_START_SCHEMA, talk_thread_start, "🧵"),  # thread
     ("talk_thread_reply", TALK_THREAD_REPLY_SCHEMA, talk_thread_reply, "💬"),  # speech balloon
+    ("talk_thread_list", TALK_THREAD_LIST_SCHEMA, talk_thread_list, "📋"),  # clipboard
+    ("talk_thread_close", TALK_THREAD_CLOSE_SCHEMA, talk_thread_close, "✅"),  # check mark
 )
 
 

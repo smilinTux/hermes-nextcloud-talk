@@ -4,6 +4,32 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.10.0] - 2026-10-30
+
+### Added
+
+- Threads in direct messages are a first-class workflow: the channel prompt
+  now covers DMs (one thread per separate matter, the main DM timeline is the
+  lobby). Routing already worked there (verified live on Talk 24.0.6: each DM
+  thread is its own Hermes session, replies land in their thread).
+- `talk_thread_list` (open threads in this room, newest activity first) and
+  `talk_thread_close` (optional one-line summary, the agent's own follow level
+  set to "never", a check mark on the title). `talk_thread_reply` refuses an
+  unprompted post into a closed thread unless `reopen=true`.
+- A person writing in a closed thread reopens it (follow level back to
+  default) and the turn is told so. A person's message re-reads thread info
+  known for over a minute, so a close made through the tools is seen.
+- Resume after a quiet spell (`NEXTCLOUD_TALK_THREAD_RESUME_HOURS`, default 6,
+  0 off): the next turn gets the thread's recent lines and a recap request.
+  Federated rooms filter the room history client-side because Talk does not
+  proxy a thread-filtered read.
+
+### Changed
+
+- The thread tools check thread support per room on the server hosting it
+  (`GET /room/{token}/capabilities`), so a federated room whose host lacks
+  threads is refused clearly. Tool text mentions DMs.
+
 ## [1.9.2] - 2026-10-27
 
 ### Fixed

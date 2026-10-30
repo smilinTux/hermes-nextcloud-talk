@@ -156,12 +156,47 @@ capabilities list `threads` (read once at connect), user mode:
   into a thread of the home channel.
 - keeps one long-poll per room and routes by each message's `threadId`, since
   Talk does not proxy a thread-filtered chat read for federated rooms.
-- adds two tools (toolset `nctalk-threads`, on whenever user-mode credentials
+- adds four tools (toolset `nctalk-threads`, on whenever user-mode credentials
   are set, `NEXTCLOUD_TALK_THREAD_TOOLS=off` hides them):
   `talk_thread_start(title, message, room?)` opens a thread and returns its
-  `thread_id`; `talk_thread_reply(message, thread_id?, room?)` posts into one
-  (default: the thread the current turn came from). `room` follows the same
-  rule as the call tools: empty means this chat.
+  `thread_id`; `talk_thread_reply(message, thread_id?, reopen?, room?)` posts
+  into one (default: the thread the current turn came from);
+  `talk_thread_list(limit?, include_closed?, room?)` lists the room's open
+  threads, newest activity first; `talk_thread_close(thread_id?, summary?, room?)`
+  puts a finished thread away. `room` follows the same rule as the call tools:
+  empty means this chat. Thread support is checked per room on the server that
+  HOSTS it (`GET /room/{token}/capabilities`, proxied for federated rooms), so a
+  federated room on a host without threads gets a clear error instead of a
+  plain message posing as a thread.
+
+**Direct messages and federated rooms (1.10.0).** Threads work the same in a
+one-to-one conversation as in a group room: each thread is its own session and
+the main DM timeline stays the lobby. The prompt asks the agent to give each
+separate matter in a DM its own thread. Federated rooms (a room hosted on
+another Nextcloud) carry `isThread`/`threadTitle` through the proxy, and
+creating, replying, renaming and follow levels are all proxied, so the same
+code path serves them. Talk itself cannot federate a one-to-one conversation:
+a "DM" with an agent on another server is a two or three person group room.
+
+**Closing threads.** Talk has no close or archive for a thread, and each
+person's follow level ("unfollow" in the clients) is private, so the agent
+cannot see that someone unfollowed. `talk_thread_close` is the agent-side
+close: it sets the agent's own follow level to "never", prefixes the title with
+a check mark (the thread's starter or a moderator may rename; in someone else's
+group-room thread the rename is skipped) and makes `talk_thread_reply` refuse
+unprompted posts into it unless `reopen=true`. When a person writes in a closed
+thread it reopens by itself (the agent's level goes back to default and the
+turn says so).
+
+**Resume after a quiet spell** (`NEXTCLOUD_TALK_THREAD_RESUME_HOURS`, default
+6, `0` off). When a thread has been quiet that long, the next turn in it gets
+the thread's recent lines (up to 12, allowed senders and the agent only) and a
+request to open with a one-line recap, so a reset Hermes session still knows
+where the matter stood. Local rooms read the thread with `threadId`; Talk does
+not proxy that filter for federated rooms (spreed `ChatController` FIXME), so
+there the last 100 room messages are read and filtered client-side. The first
+message a fresh process sees in a thread costs one history read; after that
+the gap is tracked in memory.
 
 **Thread ownership** (`NEXTCLOUD_TALK_THREAD_OWNERSHIP`, default `on`). In a
 room shared by several agents, a thread started by another agent listed in

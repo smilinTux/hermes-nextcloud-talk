@@ -242,14 +242,17 @@ CONTEXT_MAX_CHARS = 8000       # oldest backlog lines are dropped past this
 # does not proxy a thread-filtered chat read for federated rooms.
 THREADS_CAPABILITY = "threads"
 THREADS_HINT = (
-    "Group rooms can have threads: a titled side conversation under one message. "
-    "People post requests in the main timeline. When you take on a task, do the "
-    "work for it inside a thread (talk_thread_start, when you have it, opens one "
-    "titled after the task) instead of filling the main timeline. Reply where you were addressed: "
-    "an answer to a message in a thread goes into that thread on its own. When a "
-    "task finishes, post a one-line result in the main timeline if the room would "
-    "want to know. A thread another agent started is that agent's work: do not "
-    "speak in it unless you are @mentioned there. In a group room where you "
+    "Rooms and direct messages can have threads: a titled side conversation under one "
+    "message, with its own conversation for you. People post requests in the main "
+    "timeline. When you take on a task, do the work for it inside a thread "
+    "(talk_thread_start, when you have it, opens one titled after the task) instead of "
+    "filling the main timeline. In a direct message, give each separate matter its own "
+    "thread the same way; small talk and quick questions stay in the main timeline. "
+    "Reply where you were addressed: an answer to a message in a thread goes into that "
+    "thread on its own. When a task finishes, post a one-line result in the main "
+    "timeline if the room would want to know, and close the thread (talk_thread_close) "
+    "when the person says it is done. A thread another agent started is that agent's "
+    "work: do not speak in it unless you are @mentioned there. In a group room where you "
     "answer without being @mentioned (you are its Chief of Staff), answer "
     "unaddressed questions meant for the team and stay silent on human-to-human "
     "chatter; a message @mentioning someone else never reaches you as a turn."
@@ -259,6 +262,15 @@ HOME_THREAD_ENV = "NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID"
 THREAD_LOOKUP_RETRY_SECONDS = 300.0  # an unknown thread root is re-read after this
 THREAD_CACHE_MAX = 2000
 THREAD_ROOT_MAX_CHARS = 1500
+# Resume: a thread idle this long gets its recent history handed back to the
+# model on the next turn, so a reset Hermes session still knows where it stood.
+THREAD_RESUME_ENV = "NEXTCLOUD_TALK_THREAD_RESUME_HOURS"
+DEFAULT_THREAD_RESUME_HOURS = 6.0
+THREAD_RESUME_LINES = 12
+THREAD_RESUME_MAX_CHARS = 3000
+THREAD_HISTORY_SCAN = 100      # federated rooms: Talk does not proxy a thread-filtered read
+NOTIFY_DEFAULT = 0             # Talk Participant::NOTIFY_* (thread follow levels)
+NOTIFY_NEVER = 3               # "unfollow"; the agent uses it on its own side to mark a thread closed
 
 _DISPLAY_MODE_PREFIX_RE = re.compile(r"^\s*\[(mention|watch|free)\]", re.IGNORECASE)
 
@@ -467,6 +479,29 @@ def _with_thread_root(text: str, title: Optional[str], root_line: Optional[str])
     head += " Your reply goes into this thread.]"
     if root_line:
         head += f"\n[Thread started with]\n{root_line[:THREAD_ROOT_MAX_CHARS]}"
+    return f"{head}\n\n{text}"
+
+
+def _idle_phrase(seconds: float) -> str:
+    hours = seconds / 3600.0
+    if hours >= 48:
+        return f"{int(round(hours / 24))} days"
+    if hours >= 1.5:
+        return f"{int(round(hours))} hours"
+    return "a while"
+
+
+def _with_thread_resume(text: str, lines: List[str], idle_seconds: float) -> str:
+    """Prefix a turn in a thread that sat idle with where the thread stood.
+
+    The thread's Hermes session may have been reset while it was quiet; the
+    recent lines bring it back, and the model opens with a short recap so the
+    person sees where things stood before the new answer.
+    """
+    head = (f"[This thread was quiet for {_idle_phrase(idle_seconds)}. Start your reply with "
+            "one short line recapping where it stood, then answer.]")
+    if lines:
+        head += "\n[Thread so far, oldest first]\n" + "\n".join(lines)
     return f"{head}\n\n{text}"
 
 
@@ -972,6 +1007,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._threads: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # (token, thread id) pairs whose root was already handed to the model
         self._thread_root_given: set = set()
+        # (token, thread id) -> timestamp of the last message seen in it (resume detection)
+        self._thread_last_at: Dict[Tuple[str, str], float] = {}
+        raw_resume = extra.get("thread_resume_hours")
+        if raw_resume is None:
+            raw_resume = os.getenv(THREAD_RESUME_ENV, str(DEFAULT_THREAD_RESUME_HOURS))
+        try:
+            self._thread_resume_s: float = max(0.0, float(raw_resume)) * 3600.0
+        except (TypeError, ValueError):
+            self._thread_resume_s = DEFAULT_THREAD_RESUME_HOURS * 3600.0
 
     # -- Connection lifecycle -------------------------------------------
 
@@ -1315,7 +1359,14 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return
 
         actor = _extract_actor(message)
+        # Inbound needs no per-room capability check: isThread comes from the
+        # server hosting the room, so a federated host without threads never sets it.
         thread_id = _message_thread_id(message) if self._threads_enabled else None
+        msg_at = self._message_time(message)
+        prev_thread_at: Optional[float] = None
+        if thread_id:
+            prev_thread_at = self._thread_last_at.get((token, thread_id))
+            self._note_thread_activity((token, thread_id), msg_at)
         if thread_id and thread_id == msg_id:
             # A thread root (ours included): remember who opened it and how.
             self._note_thread_root(token, thread_id, message, actor)
@@ -1338,7 +1389,11 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         # the room's Chief of Staff and human chatter is not all addressed to it.
         chief_room = (mode == ROOM_MODE_FREE and chat_type != "dm" and not self._is_pair_room(token))
 
-        thread = await self._thread_info(token, thread_id) if thread_id else None
+        # A person's message re-reads a thread known for over a minute: cheap
+        # (people are slow), and it catches a close made through the tools.
+        thread = (await self._thread_info(
+            token, thread_id, max_age=None if _is_agent_actor(actor, self._agent_users) else 60.0)
+            if thread_id else None)
         if thread is not None and self._thread_ownership and chat_type != "dm":
             owner = thread.get("actor")
             if owner and self._is_self(owner):
@@ -1452,6 +1507,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             if not thread.get("title") and message.get("threadTitle"):
                 thread["title"] = message.get("threadTitle")
             event.text = _with_thread_root(event.text, thread.get("title"), root)
+        if thread is not None and thread.get("closed") and not from_agent:
+            # A person wrote in a thread we closed: it is live again.
+            await self._set_thread_level(token, thread_id, NOTIFY_DEFAULT)
+            thread["closed"] = False
+            event.text = ("[You had closed this thread; they wrote in it again, so it is open "
+                          "again.]\n\n" + event.text)
+        if thread is not None and thread_id != msg_id and self._thread_resume_s > 0:
+            event.text = await self._with_resume_if_idle(
+                token, thread_id, msg_id, msg_at, prev_thread_at, event.text)
         if chat_type != "dm" and (self._room_rules_all or token in self._room_modes):
             # Whoever creates a room writes its description; only rooms the
             # operator listed (or an explicit opt-in) may hand the agent rules.
@@ -1629,17 +1693,30 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 self._threads.pop(k, None)
         self._threads[(token, thread_id)] = info
 
-    async def _thread_info(self, token: str, thread_id: str) -> Dict[str, Any]:
+    async def _thread_info(
+        self, token: str, thread_id: str, max_age: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Who opened a thread, its title and root line, from cache or the threads API.
 
         ``GET /chat/{token}/threads/{id}`` is proxied for federated rooms. A
         failed read gives an unknown owner (the thread then follows the room
-        mode) and is retried after THREAD_LOOKUP_RETRY_SECONDS.
+        mode) and is retried after THREAD_LOOKUP_RETRY_SECONDS. ``max_age``
+        re-reads a known thread older than that, so a close made by the
+        thread tools (our follow level) is seen when a person writes again;
+        a failed re-read keeps what was known.
         """
         cached = self._threads.get((token, thread_id))
-        if cached and (cached.get("actor") or time.time() - cached.get("at", 0) < THREAD_LOOKUP_RETRY_SECONDS):
-            return cached
-        info: Dict[str, Any] = {"actor": None, "title": None, "root": None, "at": time.time()}
+        if cached:
+            age = time.time() - cached.get("at", 0)
+            if cached.get("actor"):
+                if max_age is None or age < max_age:
+                    return cached
+            elif age < THREAD_LOOKUP_RETRY_SECONDS:
+                return cached
+        info: Dict[str, Any] = {"actor": None, "title": None, "root": None, "closed": False}
+        if cached:
+            info.update(cached)
+        info["at"] = time.time()
         if self._http_client is not None:
             try:
                 resp = await self._http_client.get(
@@ -1650,6 +1727,10 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 data = resp.json().get("ocs", {}).get("data", {}) or {}
                 first = data.get("first") or {}
                 thread = data.get("thread") or {}
+                # Only OUR level is visible (Talk keeps each person's follow level
+                # private); "never" on our side is how the agent marks a thread closed.
+                level = (data.get("attendee") or {}).get("notificationLevel")
+                info["closed"] = level == NOTIFY_NEVER
                 info["title"] = thread.get("title") or first.get("threadTitle") or None
                 if first.get("actorId"):
                     actor = _extract_actor(first)
@@ -1662,6 +1743,104 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 logger.debug("[%s] thread %s/%s lookup failed: %s", self.name, token, thread_id, e)
         self._store_thread(token, thread_id, info)
         return info
+
+    @staticmethod
+    def _message_time(message: Dict[str, Any]) -> float:
+        try:
+            return float(message.get("timestamp") or 0) or time.time()
+        except (TypeError, ValueError):
+            return time.time()
+
+    def _note_thread_activity(self, key: Tuple[str, str], at: float) -> None:
+        if len(self._thread_last_at) >= THREAD_CACHE_MAX and key not in self._thread_last_at:
+            for k in sorted(self._thread_last_at, key=self._thread_last_at.get)[: THREAD_CACHE_MAX // 4]:
+                self._thread_last_at.pop(k, None)
+        self._thread_last_at[key] = max(at, self._thread_last_at.get(key, 0.0))
+
+    async def _set_thread_level(self, token: str, thread_id: str, level: int) -> bool:
+        """Set this account's own follow level on a thread (proxied for federated rooms)."""
+        if self._http_client is None:
+            return False
+        try:
+            resp = await self._http_client.post(
+                f"/ocs/v2.php/apps/spreed/api/v1/chat/{token}/threads/{thread_id}/notify",
+                params={"format": "json"}, json={"level": level},
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.debug("[%s] thread %s/%s level %s failed: %s", self.name, token, thread_id, level, e)
+            return False
+
+    async def _thread_history(self, token: str, thread_id: str, before_id: str) -> List[Tuple[float, str]]:
+        """Recent lines of one thread before *before_id*, oldest first, as (time, "- name: text").
+
+        Local rooms ask Talk for the thread only. Talk does not proxy that filter
+        for federated rooms (spreed ChatController FIXME), so there the recent
+        room history is read and filtered here. Only lines from allowed senders
+        and this account are kept, like the room-context backlog.
+        """
+        if self._http_client is None:
+            return []
+        federated = bool(self._room_meta.get(token, {}).get("remoteServer"))
+        params: Dict[str, Any] = {
+            "format": "json", "lookIntoFuture": 0, "setReadMarker": 0, "includeLastKnown": 0,
+            "lastKnownMessageId": int(before_id),
+            "limit": THREAD_HISTORY_SCAN if federated else THREAD_RESUME_LINES * 2,
+        }
+        if not federated:
+            params["threadId"] = int(thread_id)
+        try:
+            resp = await self._http_client.get(f"/ocs/v2.php/apps/spreed/api/v1/chat/{token}", params=params)
+            resp.raise_for_status()
+            if resp.status_code != 200:
+                return []  # 304: nothing before this message
+            messages = resp.json().get("ocs", {}).get("data", []) or []
+            if not isinstance(messages, list):
+                return []
+        except Exception as e:
+            logger.debug("[%s] thread %s/%s history read failed: %s", self.name, token, thread_id, e)
+            return []
+        out: List[Tuple[float, str]] = []
+        for m in messages:
+            if _message_thread_id(m) != thread_id:
+                continue
+            if m.get("messageType") not in (None, "comment", "voice-message"):
+                continue
+            actor = _extract_actor(m)
+            mine = self._is_self(actor)
+            if not mine and not self._sender_allowed(actor.get("id")):
+                continue
+            text = _resolve_mention_placeholders((m.get("message") or "").strip(), m.get("messageParameters"))
+            if not text:
+                continue
+            name = "you" if mine else (actor.get("display_name") or actor.get("id") or "someone")
+            out.append((self._message_time(m), f"- {name}: {' '.join(text.split())[:600]}"))
+        out.sort(key=lambda x: x[0])
+        return out
+
+    async def _with_resume_if_idle(
+        self, token: str, thread_id: str, msg_id: str, msg_at: float,
+        prev_at: Optional[float], text: str,
+    ) -> str:
+        """Add the thread's recent history and a recap ask when it sat idle past the resume gap.
+
+        ``prev_at`` is the last message this process saw in the thread; after a
+        restart it is unknown and the thread's own history answers it (one read).
+        """
+        history: Optional[List[Tuple[float, str]]] = None
+        if prev_at is None:
+            history = await self._thread_history(token, thread_id, msg_id)
+            if history:
+                prev_at = history[-1][0]
+        if prev_at is None or msg_at - prev_at < self._thread_resume_s:
+            return text
+        if history is None:
+            history = await self._thread_history(token, thread_id, msg_id)
+        lines = [line for _, line in history][-THREAD_RESUME_LINES:]
+        while lines and sum(len(line) + 1 for line in lines) > THREAD_RESUME_MAX_CHARS:
+            lines = lines[1:]
+        return _with_thread_resume(text, lines, msg_at - prev_at)
 
     def _thread_param(self, metadata: Optional[Dict[str, Any]]) -> Optional[int]:
         """``threadId`` for an outbound post, from Hermes' send metadata (None without threads)."""
