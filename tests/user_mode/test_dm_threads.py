@@ -39,8 +39,9 @@ def _msg(msg_id, actor_id, text, *, thread=None, root=False, title="Taxes", at=1
 class Talk:
     """Fake Talk server: thread info (with our follow level) and chat history."""
 
-    def __init__(self, history=(), level=0, owner="chef"):
+    def __init__(self, history=(), level=0, owner="chef", title="Taxes"):
         self.history = list(history)  # newest first, like Talk
+        self.title = title
         self.level = level
         self.owner = owner
         self.calls = []
@@ -52,10 +53,14 @@ class Talk:
             import json as _j
             self.level = _j.loads(request.content)["level"]
             return httpx.Response(200, json={"ocs": {"data": {}}})
+        if "/threads/" in path and request.method == "PUT":
+            import json as _j
+            self.title = _j.loads(request.content)["threadTitle"]
+            return httpx.Response(200, json={"ocs": {"data": {}}})
         if "/threads/" in path:
             tid = int(path.rsplit("/", 1)[1])
             return httpx.Response(200, json={"ocs": {"data": {
-                "thread": {"id": tid, "title": "Taxes"},
+                "thread": {"id": tid, "title": self.title},
                 "attendee": {"notificationLevel": self.level},
                 "first": _msg(tid, self.owner, "Let's sort the taxes", root=True)}}})
         if "/chat/" in path and request.method == "GET":
@@ -218,3 +223,12 @@ def test_agent_messages_use_the_thread_cache():
     _run(adapter._on_message("dm1", _msg(12, "jarvis", "b", thread=10)))
     reads = [r for r in talk.calls if r.url.path.endswith("/threads/10")]
     assert len(reads) == 1
+
+
+def test_reopen_removes_the_check_mark_from_the_title():
+    adapter = _adapter(allow_all_users="true")
+    _dm(adapter)
+    talk = Talk(level=3, title="\u2705 Taxes")
+    _wire(adapter, talk)
+    _run(adapter._on_message("dm1", _msg(11, "chef", "one more", thread=10)))
+    assert talk.level == 0 and talk.title == "Taxes"

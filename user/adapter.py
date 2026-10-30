@@ -271,6 +271,7 @@ THREAD_RESUME_MAX_CHARS = 3000
 THREAD_HISTORY_SCAN = 100      # federated rooms: Talk does not proxy a thread-filtered read
 NOTIFY_DEFAULT = 0             # Talk Participant::NOTIFY_* (thread follow levels)
 NOTIFY_NEVER = 3               # "unfollow"; the agent uses it on its own side to mark a thread closed
+CLOSED_MARK = "\u2705 "         # talk_thread_close prefixes a closed thread's title with this
 
 _DISPLAY_MODE_PREFIX_RE = re.compile(r"^\s*\[(mention|watch|free)\]", re.IGNORECASE)
 
@@ -1513,6 +1514,10 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # A person wrote in a thread we closed: it is live again.
             await self._set_thread_level(token, thread_id, NOTIFY_DEFAULT)
             thread["closed"] = False
+            title = thread.get("title") or ""
+            if title.startswith(CLOSED_MARK) and await self._rename_thread(
+                    token, thread_id, title[len(CLOSED_MARK):]):
+                thread["title"] = title[len(CLOSED_MARK):]
             event.text = ("[You had closed this thread; they wrote in it again, so it is open "
                           "again.]\n\n" + event.text)
         if thread is not None and thread_id != msg_id and self._thread_resume_s > 0:
@@ -1772,6 +1777,21 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return True
         except Exception as e:
             logger.debug("[%s] thread %s/%s level %s failed: %s", self.name, token, thread_id, level, e)
+            return False
+
+    async def _rename_thread(self, token: str, thread_id: str, title: str) -> bool:
+        """Rename a thread (its starter or a moderator only; a refusal is fine)."""
+        if self._http_client is None or not title:
+            return False
+        try:
+            resp = await self._http_client.put(
+                f"/ocs/v2.php/apps/spreed/api/v1/chat/{token}/threads/{thread_id}",
+                params={"format": "json"}, json={"threadTitle": title},
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.debug("[%s] thread %s/%s rename failed: %s", self.name, token, thread_id, e)
             return False
 
     async def _thread_history(self, token: str, thread_id: str, before_id: str) -> List[Tuple[float, str]]:
