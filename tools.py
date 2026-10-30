@@ -474,6 +474,8 @@ def _ocs(method: str, path: str, *, json_body: Optional[dict] = None,
 
     server, user, password = _talk_credentials()
     headers = {"OCS-APIRequest": "true", "Accept": "application/json"}
+    if method in ("POST", "PUT") and json_body is not None:
+        json_body = _textstyle().undash_body(json_body)
     with httpx.Client(base_url=server, auth=(user, password), headers=headers, timeout=20.0) as client:
         resp = client.request(method, path, params={**(params or {}), "format": "json"}, json=json_body)
     try:
@@ -838,6 +840,27 @@ POLL_POSTED_NOTE = ("The poll is in the chat and the person sees it. Do NOT repe
                     "get a new turn with the answer.")
 
 _room_info_cache: dict = {}
+
+
+def _load_user(name: str):
+    """A stdlib-only helper from user/, loaded by file path so it works both inside the
+    plugin package and when this file is loaded on its own (tests, CLI pre-registration)."""
+    import importlib.util
+    import sys
+
+    key = f"nctalk_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(
+        key, os.path.join(os.path.dirname(os.path.abspath(__file__)), "user", f"{name}.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _textstyle():
+    return _load_user("textstyle")
 
 
 def _pollstate():

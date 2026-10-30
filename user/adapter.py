@@ -104,9 +104,11 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 
 try:  # package import (plugin and tests both load ``user`` as a package)
-    from . import pollstate
+    from . import access, pollstate, textstyle
 except ImportError:  # pragma: no cover - loaded as a loose module
+    import access  # type: ignore
     import pollstate  # type: ignore
+    import textstyle  # type: ignore
 # Platform id. Not ``nextcloud_talk``: another author's Talk plugin in the
 # Hermes catalog registers that id, and two plugins claiming one id silently
 # replace each other. Env var names keep the NEXTCLOUD_TALK_ prefix.
@@ -1067,6 +1069,14 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._allow_all_users = _truthy(
             extra.get("allow_all_users") or os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
         )
+        # A per-agent access file (written by Agent Seats) overrides the env
+        # list when present, and is re-read when it changes.
+        self._access = access.TalkAccess(
+            extra.get("access_file") or os.getenv(access.ACCESS_FILE_ENV)
+            or access.default_path(extra.get("username") or os.getenv("NEXTCLOUD_TALK_USERNAME", "")),
+            env_users=self._allowed_users, env_allow_all=self._allow_all_users,
+        )
+        self._sync_gateway_allowlist()
         dm_mode = str(extra.get("dm_mode") or os.getenv(DM_MODE_ENV, "") or DEFAULT_DM_MODE)
         dm_mode = dm_mode.strip().lower()
         if dm_mode not in VALID_ROOM_MODES:
@@ -1329,7 +1339,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             resp.raise_for_status()
             participants = resp.json().get("ocs", {}).get("data", []) or []
             is_pair = _is_pair_participants(
-                participants, self._username, self._allowed_users, self._agent_users
+                participants, self._username, self._access.people(), self._agent_users
             )
         except Exception as e:
             logger.debug("[%s] participants of %s: %s", self.name, token, e)
@@ -1490,6 +1500,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if self._is_self(actor):
             self._note_own_poll_message(token, message)
             return  # echo of our own send
+        if (self._access.source == "file" and not _is_agent_actor(actor, self._agent_users)
+                and not self._sender_allowed(actor.get("id"), token)):
+            # Not on the access file: no turn, no thread reopen, no poll answer,
+            # no room context. Other agents pass here; the loop guard and the
+            # gateway's list decide for them. Without a file the gateway alone
+            # decides, as before (it also honors pairing and global grants).
+            logger.debug("[%s] room %s: ignoring %s (not on the access list)",
+                         self.name, token, actor.get("id"))
+            return
 
         text = (message.get("message") or "").strip()
         if not text:
@@ -2015,10 +2034,10 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
     def _poll_store(self):
         return pollstate.state_path(self._server, self._username)
 
-    def _is_person(self, actor: Dict[str, Optional[str]]) -> bool:
+    def _is_person(self, actor: Dict[str, Optional[str]], room: Optional[str] = None) -> bool:
         """A human allowed to steer us: not us, not another agent, on the allowlist."""
         return (not self._is_self(actor) and not _is_agent_actor(actor, self._agent_users)
-                and self._sender_allowed(actor.get("id")))
+                and self._sender_allowed(actor.get("id"), room))
 
     def _note_own_poll_message(self, token: str, message: Dict[str, Any]) -> None:
         """Our own native poll's chat message: keep its id so the answer turn replies to it."""
@@ -2070,7 +2089,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return
         # A reaction. Our own (working indicator, poll keycaps) and other agents' never count.
         actor = _extract_actor(message)
-        if not self._is_person(actor):
+        if not self._is_person(actor, token):
             return
         emoji = (message.get("message") or "").strip()
         parent = message.get("parent") or {}
@@ -2156,7 +2175,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         for d in data.get("details") or []:
             voter = {"id": d.get("actorId"), "display_name": d.get("actorDisplayName"),
                      "type": d.get("actorType")}
-            if not self._is_person(voter):
+            if not self._is_person(voter, token):
                 continue
             try:
                 label = options[int(d.get("optionId"))]
@@ -2192,7 +2211,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             for p in people or []:
                 voter = {"id": p.get("actorId"), "display_name": p.get("actorDisplayName"),
                          "type": p.get("actorType")}
-                if not self._is_person(voter):
+                if not self._is_person(voter, token):
                     continue
                 picks.setdefault(options[idx], []).append(voter.get("display_name") or voter.get("id"))
                 voters.setdefault(str(voter.get("id")), voter)
@@ -2310,11 +2329,27 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 self._watch_buffers[token] = []
                 await self._dispatch_watch_digest(token, events)
 
-    def _sender_allowed(self, user_id: Optional[str]) -> bool:
-        if self._allow_all_users:
-            return True
-        uid = (user_id or "").strip().lower()
-        return bool(uid) and uid in self._allowed_users
+    def _sender_allowed(self, user_id: Optional[str], room: Optional[str] = None) -> bool:
+        if self._access.reload():
+            self._sync_gateway_allowlist()
+        return self._access.allowed(user_id, room)
+
+    def _sync_gateway_allowlist(self) -> None:
+        """With an access file, hand the gateway the same list.
+
+        The adapter gates at intake; the gateway's own check is the second
+        line. It reads ``NEXTCLOUD_TALK_ALLOWED_USERS`` live (or, with no env
+        list, this adapter's ``extra.allowed_users``), so both are updated.
+        """
+        if self._access.source != "file":
+            return
+        ids = ",".join(self._access.gateway_ids())
+        os.environ["NEXTCLOUD_TALK_ALLOWED_USERS"] = ids
+        os.environ["NEXTCLOUD_TALK_ALLOW_ALL_USERS"] = "false"
+        extra = getattr(self.config, "extra", None)
+        if isinstance(extra, dict):
+            extra["allowed_users"] = ids
+            extra["allow_all_users"] = False
 
     async def _dispatch_watch_digest(self, token: str, events: List[MessageEvent]) -> None:
         """Send one watch-mode digest as an ordinary inbound event.
@@ -2356,7 +2391,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
 
-        chunks = _chunk_message(content)
+        chunks = _chunk_message(textstyle.undash(content))
         # Every chunk carries the thread: only the first has a replyTo (which
         # already lands in the thread), so without threadId chunks 2+ would
         # fall into the main timeline. Talk ignores threadId when replyTo is set.
@@ -2413,7 +2448,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             resp = await self._http_client.put(
                 f"/ocs/v2.php/apps/spreed/api/v1/chat/{chat_id}/{message_id}",
                 params={"format": "json"},
-                json={"message": content},
+                json={"message": textstyle.undash(content)},
             )
         except Exception as e:
             return SendResult(success=False, error=str(e), retryable=True)
@@ -2747,7 +2782,7 @@ async def _standalone_send(
         return {"error": "nctalk standalone send: not configured"}
 
     headers = _ocs_headers(username, app_password)
-    chunks = _chunk_message(message)
+    chunks = _chunk_message(textstyle.undash(message))
     # Hermes resolves the target's thread (for cron: <HOME_CHANNEL>_THREAD_ID)
     # and hands it over here; every chunk goes into that thread.
     thread = _thread_id_int(thread_id)

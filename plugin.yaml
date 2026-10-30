@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.11.1
+version: 1.12.0
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
