@@ -945,6 +945,42 @@ def _add_reaction(room: str, message: str, emoji: str) -> bool:
     return status < 300
 
 
+def _room_has_unlisted(room: str) -> bool:
+    """With an access file: is anyone in the room outside it?
+
+    Talk shows a native poll's voters only once it is closed, and the adapter
+    closes it on the first vote to read the answer. So in a room with people the
+    agent does not listen to, one of their votes would close the poll before an
+    allowed person answered. A numbered (reaction) poll shows every voter while
+    it is open, and unlisted reactions are simply ignored. No file, or a failed
+    participant read: False (native poll, as before)."""
+    server, user, _pw = _talk_credentials()
+    acc_mod = _load_user("access")
+    path = _env(acc_mod.ACCESS_FILE_ENV, "") or acc_mod.default_path(user)
+    acc = acc_mod.TalkAccess(path)
+    if acc.source != "file":
+        return False
+    try:
+        status, data = _request("GET", f"/ocs/v2.php/apps/spreed/api/v4/room/{room}/participants")
+    except Exception:
+        return False
+    if status >= 300 or not isinstance(data, list):
+        return False
+    agents = {a.strip().lower() for a in _env("NEXTCLOUD_TALK_AGENT_USERS", "").split(",") if a.strip()}
+    for p in data:
+        actor_type, actor_id = p.get("actorType"), str(p.get("actorId") or "")
+        if actor_type == "users" and actor_id.lower() == user.lower():
+            continue
+        if actor_type not in ("users", "federated_users", "guests", "emails"):
+            continue  # groups/circles show up as their members too
+        bare = actor_id.lower().split("@", 1)[0] if actor_type == "federated_users" else actor_id.lower()
+        if actor_id.lower() in agents or bare in agents:
+            continue
+        if not acc.allowed(actor_id, room):
+            return True
+    return False
+
+
 def talk_poll_create(args: dict, **_kw: Any) -> str:
     args = args or {}
     ps = _pollstate()
@@ -978,7 +1014,8 @@ def talk_poll_create(args: dict, **_kw: Any) -> str:
     info = _room_info(room)
     use_reactions = (info.get("type") == ROOM_TYPE_ONE_TO_ONE
                      or (info.get("federated") and bool(thread))
-                     or _truthy(args.get("reaction_poll")))
+                     or _truthy(args.get("reaction_poll"))
+                     or _room_has_unlisted(room))
     wait_for = 1
     try:
         wait_for = max(1, min(20, int(args.get("wait_for_votes") or 1)))

@@ -4,6 +4,17 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.12.1] - 2026-10-30
+
+### Fixed
+
+- With an access file, a room that holds anyone outside it now gets a numbered
+  (reaction) poll instead of a native one. Talk shows a native poll's voters
+  only once it is closed, and the adapter closes it on the first vote, so an
+  unlisted person's vote closed the poll before an allowed person answered
+  (seen live on nor). Reaction polls show each voter while open, and unlisted
+  reactions are ignored.
+
 ## [1.12.0] - 2026-10-30
 
 ### Added

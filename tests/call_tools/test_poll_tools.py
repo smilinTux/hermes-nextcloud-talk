@@ -30,11 +30,17 @@ class FakeOCS:
         self.next_poll = 40
         self.polls = {}       # poll id -> dict
         self.reactions = {}   # message id -> {emoji: [actors]}
+        self.participants = {}  # token -> [(actorType, actorId)]
 
     def __call__(self, method, path, *, json_body=None, params=None):
         self.calls.append((method, path, json_body))
         if path == "/ocs/v2.php/cloud/capabilities":
             return 200, {"capabilities": {"spreed": {"features": self.features}}}
+        m = re.match(r"/ocs/v2.php/apps/spreed/api/v4/room/([a-z0-9]+)/participants$", path)
+        if m:
+            if m.group(1) not in self.participants:
+                return 404, {}
+            return 200, [{"actorType": t, "actorId": i} for t, i in self.participants[m.group(1)]]
         m = re.match(r"/ocs/v2.php/apps/spreed/api/v4/room/([a-z0-9]+)(/capabilities)?$", path)
         if m:
             if m.group(2):
@@ -266,3 +272,27 @@ def test_silent_flag_on_thread_reply(ocs, monkeypatch):
     _call(ct.talk_thread_reply, message="quiet progress", silent=True)
     body = [c for c in ocs.calls if c[0] == "POST" and c[1].endswith("/chat/grp1")][0][2]
     assert body == {"message": "quiet progress", "threadId": 12, "silent": True}
+
+
+# -- v1.12.1: native polls only where everyone is on the access file ------------------
+
+
+def test_room_with_unlisted_person_gets_a_reaction_poll(ocs, monkeypatch, tmp_path):
+    f = tmp_path / "talk-access.yaml"
+    f.write_text("users: [chef, casey@nam.example]\n")
+    monkeypatch.setenv("NEXTCLOUD_TALK_ACCESS_FILE", str(f))
+    monkeypatch.setenv("NEXTCLOUD_TALK_AGENT_USERS", "jarvis")
+    ocs.participants["grp1"] = [("users", "hermes-bot"), ("users", "chef"),
+                                ("federated_users", "casey@nam.example"),
+                                ("federated_users", "jarvis@nam.example")]
+    ocs.participants["grp2"] = [("users", "hermes-bot"), ("users", "chef"), ("users", "mallory")]
+    _in_talk(monkeypatch, "grp1", "12245")
+    assert _call(ct.talk_poll_create, question="Which?", options=["A", "B"])["kind"] == "native"
+    _in_talk(monkeypatch, "grp2", "12246")
+    assert _call(ct.talk_poll_create, question="Which?", options=["A", "B"])["kind"] == "reaction"
+
+
+def test_without_access_file_group_poll_stays_native(ocs, monkeypatch):
+    ocs.participants["grp1"] = [("users", "hermes-bot"), ("users", "mallory")]
+    _in_talk(monkeypatch, "grp1", "12245")
+    assert _call(ct.talk_poll_create, question="Which?", options=["A", "B"])["kind"] == "native"
