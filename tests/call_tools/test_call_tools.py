@@ -194,8 +194,9 @@ def test_register_tools_gated():
     calls = [k for k in seen if k["toolset"] == "nctalk-calls"]
     threads = [k for k in seen if k["toolset"] == "nctalk-threads"]
     assert [k["name"] for k in calls] == ["call_join", "call_leave", "call_status"]
-    assert [k["name"] for k in threads] == ["talk_thread_start", "talk_thread_reply"]
-    assert len(seen) == 5
+    assert [k["name"] for k in threads] == ["talk_thread_start", "talk_thread_reply",
+                                             "talk_thread_list", "talk_thread_close"]
+    assert len(seen) == 7
     assert all(k["check_fn"] is ct.tools_enabled for k in calls)
     assert all(k["check_fn"] is ct.thread_tools_enabled for k in threads)
     for k in calls:
