@@ -4,6 +4,15 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.11.1] - 2026-10-30
+
+### Fixed
+
+- After posting a poll the agent restated every option as text and explained
+  why it was a reaction poll (seen live on nor and over federation). The tool
+  result now tells it the person already sees the poll and to end the turn
+  with one short line at most.
+
 ## [1.11.0] - 2026-10-30
 
 ### Added

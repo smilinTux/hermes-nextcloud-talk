@@ -830,6 +830,12 @@ _REACTION_PATH = "/ocs/v2.php/apps/spreed/api/v1/reaction/{room}/{message}"
 _ROOM_PATH = "/ocs/v2.php/apps/spreed/api/v4/room/{room}"
 ROOM_TYPE_ONE_TO_ONE = 1
 POLL_MARK = "\U0001F4CA"  # bar chart, leads a reaction poll's text
+# Live 2026-10-30: after posting, the model restated every option as text and
+# explained why it was a reaction poll. The person already sees the poll.
+POLL_POSTED_NOTE = ("The poll is in the chat and the person sees it. Do NOT repeat the question or "
+                    "the options, and do not explain the poll's format. End your turn now with one "
+                    "short line at most. When they vote, tap a number or reply in the thread, you "
+                    "get a new turn with the answer.")
 
 _room_info_cache: dict = {}
 
@@ -975,10 +981,8 @@ def talk_poll_create(args: dict, **_kw: Any) -> str:
                if info.get("federated") and thread else "asked for")
         return _result(**_with_note({
             "status": "posted", "kind": "reaction", "poll": rec["key"], "room": room,
-            "thread_id": thread or None, "message_id": mid,
-            "note": (f"Posted as a numbered reaction poll ({why}). When they tap a number or "
-                     "reply in the thread you get a new turn with the answer; do not ask again "
-                     "meanwhile.")}, note))
+            "thread_id": thread or None, "message_id": mid, "why_reactions": why,
+            "note": POLL_POSTED_NOTE}, note))
     if options and fill_in:
         options = options + [ps.FILL_IN_LABEL]
     body = {"question": question, "options": options, "resultMode": 0,
@@ -997,9 +1001,7 @@ def talk_poll_create(args: dict, **_kw: Any) -> str:
     ps.add(store, rec)
     return _result(**_with_note({
         "status": "created", "kind": "native", "poll": rec["key"], "poll_id": pid, "room": room,
-        "thread_id": thread or None,
-        "note": ("Talk poll posted. When they vote or reply in the thread you get a new turn with "
-                 "the answer; do not ask again meanwhile.")}, note))
+        "thread_id": thread or None, "note": POLL_POSTED_NOTE}, note))
 
 
 def _resolve_poll(args: dict, room: str) -> tuple[Optional[dict], Optional[str]]:
