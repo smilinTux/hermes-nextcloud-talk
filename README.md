@@ -185,7 +185,7 @@ close: it sets the agent's own follow level to "never", prefixes the title with
 a check mark (the thread's starter or a moderator may rename; in someone else's
 group-room thread the rename is skipped) and makes `talk_thread_reply` refuse
 unprompted posts into it unless `reopen=true`. When a person writes in a closed
-thread it reopens by itself (the agent's level goes back to default and the
+thread it reopens by itself (each human line in a thread re-reads it) (the agent's level goes back to default and the
 turn says so).
 
 **Resume after a quiet spell** (`NEXTCLOUD_TALK_THREAD_RESUME_HOURS`, default

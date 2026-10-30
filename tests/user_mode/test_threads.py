@@ -241,7 +241,7 @@ def test_first_turn_in_a_thread_gets_the_root_then_only_replies():
     assert "Plan the release" not in adapter.handled_events[-1].text
 
 
-def test_unknown_thread_root_is_looked_up_once():
+def test_unknown_thread_root_is_given_once_and_people_re_read_state():
     adapter = _adapter(room_modes="tok1=free")
     _room(adapter)
     lookups = []
@@ -258,8 +258,11 @@ def test_unknown_thread_root_is_looked_up_once():
     _recording_client(adapter, info)
     _run(adapter._on_message("tok1", _msg(11, "alice", "update?", thread=10)))
     _run(adapter._on_message("tok1", _msg(12, "alice", "more?", thread=10)))
-    assert lookups == ["/ocs/v2.php/apps/spreed/api/v1/chat/tok1/threads/10"]
+    # 1.10.1: every human line re-reads thread state (catches a fresh close);
+    # the root is still handed to the model only on the thread's first turn.
+    assert lookups == ["/ocs/v2.php/apps/spreed/api/v1/chat/tok1/threads/10"] * 2
     assert "Alice: the original ask" in adapter.handled_events[0].text
+    assert "the original ask" not in adapter.handled_events[1].text
 
 
 def test_backlog_edit_inside_a_thread_is_applied():

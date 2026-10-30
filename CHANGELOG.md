@@ -4,6 +4,15 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.10.1] - 2026-10-30
+
+### Fixed
+
+- A person writing in a thread the agent closed moments earlier did not
+  reopen it: thread info was cached for 60 seconds, and live the reply came
+  13 seconds after the close. A person's message in a thread now always
+  re-reads the thread (agents still use the cache).
+
 ## [1.10.0] - 2026-10-30
 
 ### Added
