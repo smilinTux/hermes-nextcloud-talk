@@ -4,6 +4,29 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.12.0] - 2026-10-30
+
+### Added
+
+- Per-agent access file, `~/.skcapstone/agents/<agent>/config/talk-access.yaml`
+  (or `NEXTCLOUD_TALK_ACCESS_FILE`): `users` (people who can talk to the agent
+  and answer its polls), `agents` (other agents it must hear) and optional
+  per-room `rooms` rules. Re-read within seconds of a change, meant to be written
+  by the Agent Seats app instead of editing `.env`. When present it overrides
+  `NEXTCLOUD_TALK_ALLOWED_USERS` / `NEXTCLOUD_TALK_ALLOW_ALL_USERS` and hands the
+  gateway the same list. A file that fails to parse keeps the last good list.
+- Outbound style filter: every message, edit, thread title, poll question and
+  option the agent posts has em/en dash punctuation rewritten (numeric ranges
+  get a hyphen, other dashes a comma or colon). Code spans, fenced blocks and
+  URLs are left alone.
+
+### Fixed
+
+- With an access file, a person not on it is ignored at intake: before, an
+  unlisted person could reopen a closed thread or answer an open poll by
+  writing in its thread before the gateway dropped the message. Without a file
+  the gateway alone decides, as before.
+
 ## [1.11.1] - 2026-10-30
 
 ### Fixed

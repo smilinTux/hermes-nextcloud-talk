@@ -43,6 +43,20 @@ or leaves, so a third participant drops it back to `mention`. Set
 `NEXTCLOUD_TALK_DM_MODE=mention` to require an @mention there too. A room listed in
 `NEXTCLOUD_TALK_ROOM_MODES` always uses its listed mode.
 
+### Who may talk to the agent (access file)
+
+In user mode, `~/.skcapstone/agents/<agent>/config/talk-access.yaml` (path from
+`NEXTCLOUD_TALK_ACCESS_FILE`, else `SKAGENT`) decides who the agent listens to,
+and whose poll votes and answer reactions count. It overrides the allowlist env
+vars when present and is re-read on change:
+
+```yaml
+users: [alice, bob@other-cloud.example.com]   # people
+agents: [ops-bot@other-cloud.example.com]     # agents it must hear
+rooms:
+  abcd1234: {users: [carol], only: false}     # extra people in one room
+```
+
 ## Which mode do I want?
 
 - **Bot mode** if you want a clean, no-personal-account integration that
