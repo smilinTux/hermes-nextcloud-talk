@@ -1389,10 +1389,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         # the room's Chief of Staff and human chatter is not all addressed to it.
         chief_room = (mode == ROOM_MODE_FREE and chat_type != "dm" and not self._is_pair_room(token))
 
-        # A person's message re-reads a thread known for over a minute: cheap
-        # (people are slow), and it catches a close made through the tools.
+        # A person's message always re-reads the thread: one GET per human
+        # line is cheap, and it catches a close the thread tools made even
+        # seconds ago (live 2026-10-30: a reply 13s after a close kept a
+        # 60s-cached "open" and the thread stayed closed).
         thread = (await self._thread_info(
-            token, thread_id, max_age=None if _is_agent_actor(actor, self._agent_users) else 60.0)
+            token, thread_id, max_age=None if _is_agent_actor(actor, self._agent_users) else 0.0)
             if thread_id else None)
         if thread is not None and self._thread_ownership and chat_type != "dm":
             owner = thread.get("actor")

@@ -198,13 +198,23 @@ def test_person_writing_in_closed_thread_reopens_it():
     assert "open again" in adapter.handled_events[0].text
 
 
-def test_close_made_by_tools_is_seen_after_a_minute():
+def test_close_made_by_tools_is_seen_on_the_very_next_person_message():
     adapter = _adapter(allow_all_users="true")
     _dm(adapter)
     talk = Talk(level=0)
     _wire(adapter, talk)
     _run(adapter._on_message("dm1", _msg(11, "chef", "a", thread=10)))
-    talk.level = 3  # talk_thread_close ran in between
-    adapter._threads[("dm1", "10")]["at"] -= 120
+    talk.level = 3  # talk_thread_close ran in between, seconds ago
     _run(adapter._on_message("dm1", _msg(12, "chef", "b", thread=10, at=1700000060)))
     assert "open again" in adapter.handled_events[1].text and talk.level == 0
+
+
+def test_agent_messages_use_the_thread_cache():
+    adapter = _adapter(agent_users="jarvis", allow_all_users="true")
+    _dm(adapter)
+    talk = Talk()
+    _wire(adapter, talk)
+    _run(adapter._on_message("dm1", _msg(11, "jarvis", "a", thread=10)))
+    _run(adapter._on_message("dm1", _msg(12, "jarvis", "b", thread=10)))
+    reads = [r for r in talk.calls if r.url.path.endswith("/threads/10")]
+    assert len(reads) == 1
