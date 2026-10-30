@@ -4,6 +4,41 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.11.0] - 2026-10-30
+
+### Added
+
+- Poll tools (toolset `nctalk-polls`): `talk_poll_create`, `talk_poll_status`,
+  `talk_poll_close`. The agent offers its top 2 to 4 choices plus a "something
+  else, reply here" line. Where Talk allows it this is a native Talk poll; in a
+  one-to-one chat (Talk 24 refuses polls there, `error: room`) and inside a
+  thread of a federated room (the federation proxy drops `threadId`, so the
+  poll would land in the host's main timeline) it is a numbered message the
+  person answers by tapping a keycap reaction the agent already placed.
+- The agent wakes in the poll's own thread when it is answered: a vote (after
+  `NEXTCLOUD_TALK_POLL_SETTLE_SECONDS`, default 15; the adapter closes the poll
+  to read it, because Talk shows the author only the voter count while a poll
+  is open), a keycap reaction, or a person's message in that thread, which is
+  taken as their own answer and closes the poll. One turn per poll. Open polls
+  live in `$HERMES_HOME/nctalk/polls-<account>.json`.
+- Answer reactions: a check mark or cross a person puts on one of the agent's
+  messages gives it a turn (yes / no to a question, or "done" on a thread's
+  last message, which closes the thread). `NEXTCLOUD_TALK_REACTION_TURNS`.
+- Server capabilities: the adapter reads the server's capabilities (daily) and,
+  for a federated room, the host's Talk features, and tells the model once per
+  conversation what the chat supports (threads, polls, scheduled and silent
+  messages, reactions) and which apps the agent's account has.
+  `NEXTCLOUD_TALK_CAPABILITY_NOTE=off` turns it off.
+- `talk_message_schedule` (toolset `nctalk-server`): schedule, list or cancel a
+  Talk scheduled message, in the current thread by default. Federated rooms
+  refuse it (HTTP 406), so the tool says so instead of trying.
+- `nextcloud_ocs_call`: read-only lookups as the agent's account (someone's
+  status, a profile, unified search, participants, message context, threads,
+  polls, reactions, capabilities) plus adding or removing its own reaction.
+  Every other path is refused by an allowlist.
+- `silent` on `talk_thread_start` and `talk_thread_reply`.
+- A poll shared by a person reads as `[poll: question]` instead of `{object}`.
+
 ## [1.10.2] - 2026-10-30
 
 ### Fixed

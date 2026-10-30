@@ -220,6 +220,36 @@ session and posts replies with `threadId`; bots cannot open threads here.
 Without the `threads` capability (or if the capability read fails) nothing of
 this applies and the adapter behaves exactly like 1.8.4.
 
+### Polls and answer reactions (user mode)
+
+`talk_poll_create` lets the agent ask the person to pick a direction: the top
+2 to 4 choices plus a "something else, reply here" line. Talk 24 has no polls
+in one-to-one chats, and a poll started from a federated copy of a room cannot
+go inside a thread, so there the tool posts a numbered message with keycap
+reactions already placed: the person taps 1, 2 or 3. Either way the agent gets
+a new turn in the poll's thread when it is answered, by a vote, a tap, or a
+reply in the thread (their own answer, which closes the poll).
+
+| Where | Native Talk poll | Reaction poll |
+|---|---|---|
+| Group room, main timeline or thread | yes | on request |
+| One-to-one chat | no (Talk refuses) | yes |
+| Federated room, main timeline | yes | on request |
+| Federated room, inside a thread | no (proxy drops the thread) | yes |
+
+Yes/no questions are not polls: the agent asks in one line and the person
+reacts with a check mark or a cross, which reaches the agent as a turn
+(`NEXTCLOUD_TALK_REACTION_TURNS`, default check mark and cross).
+
+### Server capabilities (user mode)
+
+Once per conversation the model is told what the chat's Talk server supports
+and which Nextcloud apps its own account has (re-read daily; federated rooms
+use the host's Talk features). `talk_message_schedule` posts a message later
+(not in federated rooms: the host refuses it). `nextcloud_ocs_call` covers
+read-only lookups such as a person's status or a unified search, behind an
+allowlist; it cannot write anything but the agent's own reactions.
+
 ### Free rooms: Chief of Staff (user mode)
 
 In a `free` group room (listed in `NEXTCLOUD_TALK_ROOM_MODES`; DMs and
