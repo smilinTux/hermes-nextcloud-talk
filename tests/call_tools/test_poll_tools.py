@@ -131,7 +131,8 @@ def test_dm_gets_reaction_poll_with_keycaps_preplaced(ocs, monkeypatch):
     ocs.rooms["dmx1"] = {"type": ONE}
     _in_talk(monkeypatch, "dmx1", "10")
     out = _call(ct.talk_poll_create, question="Next?", options=["Fix it", "Ship it", "Park it"])
-    assert out["kind"] == "reaction" and "one-to-one" in out["note"]
+    assert out["kind"] == "reaction" and "one-to-one" in out["why_reactions"]
+    assert "Do NOT repeat" in out["note"]
     assert not ocs.posts("/poll/")  # Talk would refuse it: never even tried
     post = ocs.posts("/chat/dmx1")[0][2]
     assert post["threadId"] == 10
