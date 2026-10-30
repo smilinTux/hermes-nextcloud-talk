@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.10.2] - 2026-10-30
+
+### Fixed
+
+- A closed thread reopened by a person's message kept the check mark on its
+  title (only `talk_thread_reply(reopen=true)` removed it). The adapter now
+  removes it too, so the title says what the thread's state is.
+
 ## [1.10.1] - 2026-10-30
 
 ### Fixed
