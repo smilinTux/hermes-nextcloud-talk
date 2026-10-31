@@ -4,6 +4,15 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.13.0] - 2026-10-30
+
+### Added
+
+- Markdown tables are posted as lists, because the Talk phone apps print a
+  table as raw pipes. A two column table becomes `- **left**: right`; a wider
+  one becomes a bold first cell with a `Header: value` line per column. Code
+  fences are left alone. `NEXTCLOUD_TALK_TABLES=keep` posts tables unchanged.
+
 ## [1.12.1] - 2026-10-30
 
 ### Fixed

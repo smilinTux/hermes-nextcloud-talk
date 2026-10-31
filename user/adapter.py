@@ -2391,7 +2391,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
 
-        chunks = _chunk_message(textstyle.undash(content))
+        chunks = _chunk_message(textstyle.tidy(content))
         # Every chunk carries the thread: only the first has a replyTo (which
         # already lands in the thread), so without threadId chunks 2+ would
         # fall into the main timeline. Talk ignores threadId when replyTo is set.
@@ -2448,7 +2448,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             resp = await self._http_client.put(
                 f"/ocs/v2.php/apps/spreed/api/v1/chat/{chat_id}/{message_id}",
                 params={"format": "json"},
-                json={"message": textstyle.undash(content)},
+                json={"message": textstyle.tidy(content)},
             )
         except Exception as e:
             return SendResult(success=False, error=str(e), retryable=True)
@@ -2782,7 +2782,7 @@ async def _standalone_send(
         return {"error": "nctalk standalone send: not configured"}
 
     headers = _ocs_headers(username, app_password)
-    chunks = _chunk_message(textstyle.undash(message))
+    chunks = _chunk_message(textstyle.tidy(message))
     # Hermes resolves the target's thread (for cron: <HOME_CHANNEL>_THREAD_ID)
     # and hands it over here; every chunk goes into that thread.
     thread = _thread_id_int(thread_id)
