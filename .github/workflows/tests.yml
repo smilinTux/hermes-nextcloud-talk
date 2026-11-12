@@ -17,6 +17,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test dependencies
-        run: pip install aiohttp httpx pytest pytest-asyncio
+        run: pip install aiohttp httpx pyyaml pytest pytest-asyncio
       - name: Run tests
         run: python -m pytest tests/ -q
