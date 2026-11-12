@@ -22,7 +22,3 @@ _STUBS_DIR = os.path.join(_TESTS_DIR, "stubs")
 for path in (_STUBS_DIR, _REPO_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
-
-# The adapter auto-detects nc-live from the real Hermes config; keep the suite
-# hermetic (tests that need it on or auto set it themselves).
-os.environ.setdefault("NEXTCLOUD_TALK_LIVE_DOCS", "off")
