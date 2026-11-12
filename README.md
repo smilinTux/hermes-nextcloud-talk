@@ -391,6 +391,69 @@ Hermes. See [docs/nextcloud-mcp.md](docs/nextcloud-mcp.md) for a tested config
 that reuses this plugin's credentials and a read-only tool allowlist to start
 with.
 
+### Live document editing (optional)
+
+With [sk-nc-live](https://github.com/smilinTux/sk-nc-live), a separate MCP
+server, the agent edits Nextcloud Text markdown and Collabora office documents
+live while people have them open: the change shows in their editor within a
+second, under the agent's name. Its tools are `live_doc_read`,
+`live_doc_status`, `live_doc_headings`, `live_doc_append`,
+`live_doc_insert_after_heading`, `live_doc_replace_section` and
+`live_doc_find_replace`; each takes a path, a fileid or a `/f/<fileid>` link.
+
+Install sk-nc-live (see its README) so `sk-nc-live-mcp` is on the gateway's
+`PATH`, then add it to Hermes:
+
+```
+hermes nctalk nc-live-setup --dry-run   # show the block
+hermes nctalk nc-live-setup             # show it, ask, then write it
+```
+
+It adds this to the profile's `config.yaml` and never changes an existing
+`nc-live` entry:
+
+```yaml
+mcp_servers:
+  nc-live:
+    command: "sk-nc-live-mcp"
+    args: []
+    env:
+      NEXTCLOUD_HOST: "${NEXTCLOUD_TALK_SERVER_URL}"
+      NEXTCLOUD_USERNAME: "${NEXTCLOUD_TALK_USERNAME}"
+      NEXTCLOUD_PASSWORD: "${NEXTCLOUD_TALK_APP_PASSWORD}"
+    enabled: true
+```
+
+The values are references that Hermes expands from the profile's env when it
+starts the server, so no secret is written into the config. As with the
+general Nextcloud MCP, a separate app password is recommended
+(`--password-env NEXTCLOUD_LIVE_APP_PASSWORD`, then set that variable), and
+`--command` takes a wrapper script instead. On a Hermes without plugin CLI
+commands, paste the block by hand. Restart the gateway afterwards.
+
+These are write tools, and Talk is a prompt channel: anyone in a room the agent
+answers in can ask it to edit any document its account can open. The account's
+shares are the boundary. To keep them off Talk, leave `nc-live` out of
+`platform_toolsets.nctalk`.
+
+**Shared documents in chat (user mode).** When someone shares a file in a room,
+or pastes a link like `https://cloud.example.com/index.php/f/123` to the
+agent's own server, the agent's turn gets one line with the facts:
+
+```
+[shared file: Notes.md, fileid 123, path Talk/Notes.md, editable live with live_doc_* tools]
+```
+
+so "@agent fix the intro" works without a link. The last three text and office
+documents per room are remembered in memory (`NEXTCLOUD_TALK_RECENT_DOCS`, 0
+turns it off) and listed on later turns, so "the doc" keeps working, also after
+a share that did not @mention the agent. The `live_doc_*` hint appears only
+when `nc-live` is configured for Talk (`NEXTCLOUD_TALK_LIVE_DOCS=auto`, the
+default; `on` or `off` overrides it). Without it the line has the file facts
+only. Files shared from a federated room have no path on this server and are
+left out. Bot mode does not add these lines: the bot has no account that could
+open the file.
+
 ### Joining calls (optional, opt-in)
 
 With `NEXTCLOUD_TALK_CALL_TOOLS=on` the agent gets three tools (toolset
@@ -469,7 +532,7 @@ Combined (both modes available, pick one via credentials as above):
 
 ```
 mkdir -p ~/.hermes/plugins/nctalk
-cp -r __init__.py plugin.yaml tools.py bot user ~/.hermes/plugins/nctalk/
+cp -r __init__.py plugin.yaml tools.py nclive_setup.py bot user ~/.hermes/plugins/nctalk/
 ```
 
 Bot mode only:
@@ -484,8 +547,7 @@ User mode only:
 
 ```
 mkdir -p ~/.hermes/plugins/nctalk_user
-cp user/adapter.py user/plugin.yaml ~/.hermes/plugins/nctalk_user/
-cp user/__init__.py ~/.hermes/plugins/nctalk_user/__init__.py
+cp user/*.py user/plugin.yaml ~/.hermes/plugins/nctalk_user/
 ```
 
 ## Repo layout
@@ -501,6 +563,8 @@ cp user/__init__.py ~/.hermes/plugins/nctalk_user/__init__.py
   and the adapter class (it is a single, much simpler transport than the
   bot's webhook/HMAC machinery, so it was not worth splitting into a
   separate core module).
+- `nclive_setup.py` -- `hermes nctalk nc-live-setup` (adds the optional
+  sk-nc-live MCP server to `config.yaml`), tested in `tests/setup/`.
 - `tools.py` -- the opt-in call tools (`call_join`, `call_leave`,
   `call_status`) and the thread tools (`talk_thread_start`,
   `talk_thread_reply`); stdlib at import time, tested in `tests/call_tools/`.

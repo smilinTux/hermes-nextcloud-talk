@@ -82,3 +82,9 @@ Notes:
 - Known upstream issue (v0.201.2): `talk_list_conversations` fails on
   federated rooms.
 - First access to Deck creates Deck's own "Welcome" board on the account.
+
+## Live document editing
+
+For editing Text markdown and office documents while people have them open,
+add the separate sk-nc-live MCP server with `hermes nctalk nc-live-setup`. See
+"Live document editing (optional)" in the [README](../README.md).
