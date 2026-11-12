@@ -113,6 +113,13 @@ def register(ctx) -> None:
     except Exception:  # pragma: no cover - defensive
         import logging
         logging.getLogger(__name__).warning("nctalk: call tools not registered", exc_info=True)
+    # ``hermes nctalk nc-live-setup``: optional, adds the sk-nc-live MCP server.
+    try:
+        from .nclive_setup import register_cli
+        register_cli(ctx)
+    except Exception:  # pragma: no cover - defensive
+        import logging
+        logging.getLogger(__name__).warning("nctalk: CLI command not registered", exc_info=True)
     ctx.register_platform(
         name=_user.PLATFORM_NAME,
         label="Nextcloud Talk",

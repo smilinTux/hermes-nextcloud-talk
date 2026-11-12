@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.14.0
+version: 1.15.0
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -213,6 +213,19 @@ optional_env:
   - name: NEXTCLOUD_TALK_STATE_DIR
     description: "User mode: where open polls are kept (default $HERMES_HOME/nctalk)"
     prompt: "State directory (default $HERMES_HOME/nctalk)"
+    password: false
+  - name: NEXTCLOUD_TALK_LIVE_DOCS
+    description: >-
+      User mode: 'auto' (default) adds the live_doc_* hint to shared-document
+      lines only when the optional sk-nc-live MCP server (mcp_servers.nc-live)
+      is configured for Talk; 'on' always, 'off' never (file facts stay).
+    prompt: "Live-doc hint (auto/on/off, default auto)"
+    password: false
+  - name: NEXTCLOUD_TALK_RECENT_DOCS
+    description: >-
+      User mode: shared documents remembered per room, in memory, so a later
+      message can say "the doc" (default 3, 0 disables)
+    prompt: "Recent docs per room (default 3, 0 disables)"
     password: false
   # -- Call tools (opt-in) --
   - name: NEXTCLOUD_TALK_CALL_TOOLS

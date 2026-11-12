@@ -4,6 +4,38 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.15.0] - 2026-11-12
+
+### Added
+
+- Shared-document context (user mode). A file shared in Talk (a `file` rich
+  object with a path on this server), or a pasted `https://<server>/index.php/f/<fileid>`
+  link to the agent's own Nextcloud, adds one line to the turn:
+  `[shared file: Notes.md, fileid 123, path Talk/Notes.md]`. The last few
+  text and office documents shared per room by allowed people or the agent
+  itself (`NEXTCLOUD_TALK_RECENT_DOCS`, default 3,
+  in memory only) are listed on later turns, so "fix the intro in the doc"
+  works without anyone pasting a link, including after a share that did not
+  @mention the agent. Files from federated rooms (no path here) are left out;
+  names are flattened to one line so a file name cannot add prompt lines.
+- When the optional [sk-nc-live](https://github.com/smilinTux/sk-nc-live) MCP
+  server is configured for Talk (an enabled `mcp_servers.nc-live` that
+  `platform_toolsets.nctalk` does not exclude), editable documents also get
+  "editable live with live_doc_* tools". `NEXTCLOUD_TALK_LIVE_DOCS=on|off`
+  overrides the detection.
+- `hermes nctalk nc-live-setup` adds that `mcp_servers.nc-live` entry to the
+  profile's `config.yaml`. It shows the block and asks first (`--yes`,
+  `--dry-run`), never touches an existing `nc-live` entry, and writes
+  `${NEXTCLOUD_TALK_SERVER_URL}` / `${NEXTCLOUD_TALK_USERNAME}` /
+  `${NEXTCLOUD_TALK_APP_PASSWORD}` references (or `--password-env NAME` for a
+  separate app password), never a secret. The edit keeps comments, writes a
+  backup, and is re-parsed and compared before it replaces the file.
+
+### Changed
+
+- A turn whose message carries a shared file now starts with the
+  `[shared file: ...]` line, before any inlined file content.
+
 ## [1.14.0] - 2026-11-07
 
 ### Added

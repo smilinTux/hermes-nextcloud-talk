@@ -108,9 +108,10 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 
 try:  # package import (plugin and tests both load ``user`` as a package)
-    from . import access, pollstate, textstyle, threadsmode
+    from . import access, livedocs, pollstate, textstyle, threadsmode
 except ImportError:  # pragma: no cover - loaded as a loose module
     import access  # type: ignore
+    import livedocs  # type: ignore
     import pollstate  # type: ignore
     import textstyle  # type: ignore
     import threadsmode  # type: ignore
@@ -1205,6 +1206,13 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if raw_note is None:
             raw_note = os.getenv(CAPS_NOTE_ENV, "on")
         self._caps_note_on: bool = str(raw_note).strip().lower() not in ("0", "off", "false", "no")
+        # Shared documents: facts for the turn, the last few per room for "the doc",
+        # and the live_doc_* hint only when the nc-live MCP server is configured.
+        raw_live = extra.get("live_docs")
+        self._live_docs: bool = livedocs.live_tools_available(
+            threadsmode.hermes_home(), None if raw_live is None else str(raw_live))
+        self._recent_docs = livedocs.RecentDocs(livedocs.recent_docs_limit(
+            None if extra.get("recent_docs") is None else str(extra.get("recent_docs"))))
 
     # -- Connection lifecycle -------------------------------------------
 
@@ -1572,6 +1580,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             self._note_thread_root(token, thread_id, message, actor)
         if self._is_self(actor):
             self._note_own_poll_message(token, message)
+            # A file we shared ourselves is "the doc" for the next message too.
+            self._recent_docs.note(
+                token, reversed(livedocs.docs_from_parameters(message.get("messageParameters"))))
             return  # echo of our own send
         if (self._access.source == "file" and not _is_agent_actor(actor, self._agent_users)
                 and not self._sender_allowed(actor.get("id"), token)):
@@ -1624,6 +1635,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         text = _resolve_file_placeholders(text, message.get("messageParameters"))
         text = _resolve_object_placeholders(text, message.get("messageParameters"))
         shared_files = _file_parameters(message.get("messageParameters"))
+        # Noted before any mode gate: a doc shared without an @mention is still
+        # "the doc" for the next message that does address us.
+        docs = livedocs.docs_from_parameters(message.get("messageParameters"))
+        known = {d["id"] for d in docs}
+        docs += [d for d in livedocs.docs_from_links(text, self._server) if d["id"] not in known]
+        if self._sender_allowed(actor.get("id")):
+            # Same filter as the context backlog: an unlisted sender's share
+            # never becomes "the doc" for someone else's later turn.
+            self._recent_docs.note(token, reversed(docs))
         if mentioned:
             bare = _strip_leading_self_mention(text, self._username, self._display_name)
             if bare.startswith("/"):
@@ -1752,6 +1772,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 before_poll = event.text
                 event.text = await self._with_poll_fill_in(token, thread_id, event.text)
                 poll_answer = event.text != before_poll
+        doc_line = livedocs.context_line(docs, self._recent_docs.get(token), self._live_docs)
+        if doc_line:
+            event.text = f"{doc_line}\n\n{event.text}"
         event.text = await self._with_capability_note(token, thread_id, chat_type, room, event.text)
         if not from_agent and not thread_id and not poll_answer:
             event.text = await self._with_threads_mode(token, msg_id, actor, text, room, event.text)

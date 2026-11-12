@@ -9,3 +9,5 @@ def _poll_state_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("NEXTCLOUD_TALK_STATE_DIR", str(tmp_path / "nctalk-state"))
     # Never pick up a real agent's talk-access.yaml from ~/.skcapstone.
     monkeypatch.setenv("NEXTCLOUD_TALK_ACCESS_FILE", str(tmp_path / "no-access-file.yaml"))
+    # Never detect nc-live from the real Hermes config (tests that need it set it).
+    monkeypatch.setenv("NEXTCLOUD_TALK_LIVE_DOCS", "off")
