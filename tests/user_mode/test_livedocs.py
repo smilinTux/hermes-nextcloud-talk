@@ -28,7 +28,8 @@ def _run(coro):
 def _adapter(live=True, **extra):
     adapter = NextcloudTalkUserAdapter(PlatformConfig(extra={
         "server_url": SERVER, "username": "hermes-bot", "app_password": "x",
-        "room_modes": "tok1=mention", "live_docs": "on" if live else "off", **extra}))
+        "room_modes": "tok1=mention", "live_docs": "on" if live else "off",
+        "allowed_users": "alice", **extra}))
     adapter._room_meta["tok1"] = {"token": "tok1", "type": ROOM_TYPE_GROUP, "displayName": "Team"}
     adapter._room_meta["tok2"] = {"token": "tok2", "type": ROOM_TYPE_GROUP, "displayName": "Other"}
     return adapter
@@ -193,3 +194,19 @@ def test_slash_command_with_a_doc_is_left_verbatim():
     _run(adapter._on_message("tok1", _msg(2, "{mention-user1} /new", ME)))
     (event,) = adapter.handled_events
     assert event.text == "/new"
+
+
+def test_doc_shared_by_this_account_is_the_doc_for_the_next_turn():
+    adapter = _adapter()
+    _run(adapter._on_message("tok1", _msg(1, "{file}", {"file": DOC}, actor="hermes-bot")))
+    _run(adapter._on_message("tok1", _msg(2, "{mention-user1} fix the intro", ME)))
+    (event,) = adapter.handled_events
+    assert "[earlier shared doc in this room, newest first: Tracker.md, fileid 4242" in event.text
+
+
+def test_doc_from_a_sender_outside_the_allowlist_is_not_remembered():
+    adapter = _adapter(allowed_users="alice")
+    _run(adapter._on_message("tok1", _msg(1, "here", {"file": DOC}, actor="mallory")))
+    _run(adapter._on_message("tok1", _msg(2, "{mention-user1} fix the doc", ME)))
+    (event,) = adapter.handled_events
+    assert "fileid" not in event.text

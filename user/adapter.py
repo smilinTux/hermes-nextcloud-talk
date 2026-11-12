@@ -1580,6 +1580,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             self._note_thread_root(token, thread_id, message, actor)
         if self._is_self(actor):
             self._note_own_poll_message(token, message)
+            # A file we shared ourselves is "the doc" for the next message too.
+            self._recent_docs.note(
+                token, reversed(livedocs.docs_from_parameters(message.get("messageParameters"))))
             return  # echo of our own send
         if (self._access.source == "file" and not _is_agent_actor(actor, self._agent_users)
                 and not self._sender_allowed(actor.get("id"), token)):
@@ -1637,7 +1640,10 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         docs = livedocs.docs_from_parameters(message.get("messageParameters"))
         known = {d["id"] for d in docs}
         docs += [d for d in livedocs.docs_from_links(text, self._server) if d["id"] not in known]
-        self._recent_docs.note(token, reversed(docs))
+        if self._sender_allowed(actor.get("id")):
+            # Same filter as the context backlog: an unlisted sender's share
+            # never becomes "the doc" for someone else's later turn.
+            self._recent_docs.note(token, reversed(docs))
         if mentioned:
             bare = _strip_leading_self_mention(text, self._username, self._display_name)
             if bare.startswith("/"):
