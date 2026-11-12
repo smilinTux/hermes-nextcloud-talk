@@ -34,7 +34,7 @@ def _adapter(live=True, **extra):
     return adapter
 
 
-def _msg(msg_id, text, params=None, actor="chef"):
+def _msg(msg_id, text, params=None, actor="alice"):
     return {"id": msg_id, "actorId": actor, "actorType": "users", "actorDisplayName": actor,
             "message": text, "messageType": "comment", "messageParameters": params or {},
             "timestamp": 1700000000}
@@ -43,7 +43,7 @@ def _msg(msg_id, text, params=None, actor="chef"):
 # -- pure helpers --------------------------------------------------------------
 
 def test_docs_from_parameters_reads_spreed_file_objects():
-    docs = livedocs.docs_from_parameters({"actor": {"type": "user", "id": "chef"}, "file": DOC})
+    docs = livedocs.docs_from_parameters({"actor": {"type": "user", "id": "alice"}, "file": DOC})
     assert docs == [{"id": "4242", "name": "Tracker.md", "path": "Talk/Tracker.md",
                      "mimetype": "text/markdown", "editable": "1"}]
 
