@@ -1013,7 +1013,8 @@ def test_text_file_is_downloaded_cached_and_inlined():
     assert event.message_type.value == "document"
     assert event.media_types == ["text/plain"] and len(event.media_urls) == 1
     assert event.media_text_inlined == [True]
-    assert event.text.startswith("[Content of spike.txt]:\nhello from the spike")
+    assert event.text.startswith("[shared file: spike.txt, fileid 8795078, path Talk/spike.txt]\n\n")
+    assert "[Content of spike.txt]:\nhello from the spike" in event.text
 
 
 def test_image_attaches_as_photo_without_inlining():
@@ -1023,7 +1024,8 @@ def test_image_attaches_as_photo_without_inlining():
     event = adapter.handled_events[0]
     assert event.message_type.value == "photo"
     assert event.media_types == ["image/png"] and event.media_text_inlined == [False]
-    assert event.text == "look [file: cat.png (image/png)]"
+    assert event.text == ("[shared file: cat.png, fileid 8795078, path Talk/cat.png]\n\n"
+                          "look [file: cat.png (image/png)]")
 
 
 def test_voice_message_goes_to_stt_as_voice():
