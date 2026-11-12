@@ -12,7 +12,8 @@ combined plugin's (`plugin.yaml` at the repo root).
   object with a path on this server), or a pasted `https://<server>/index.php/f/<fileid>`
   link to the agent's own Nextcloud, adds one line to the turn:
   `[shared file: Notes.md, fileid 123, path Talk/Notes.md]`. The last few
-  text and office documents per room (`NEXTCLOUD_TALK_RECENT_DOCS`, default 3,
+  text and office documents shared per room by allowed people or the agent
+  itself (`NEXTCLOUD_TALK_RECENT_DOCS`, default 3,
   in memory only) are listed on later turns, so "fix the intro in the doc"
   works without anyone pasting a link, including after a share that did not
   @mention the agent. Files from federated rooms (no path here) are left out;

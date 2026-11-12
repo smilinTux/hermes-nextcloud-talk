@@ -445,7 +445,8 @@ agent's own server, the agent's turn gets one line with the facts:
 ```
 
 so "@agent fix the intro" works without a link. The last three text and office
-documents per room are remembered in memory (`NEXTCLOUD_TALK_RECENT_DOCS`, 0
+documents shared per room (by people allowed to talk to the agent, or by the
+agent itself) are remembered in memory (`NEXTCLOUD_TALK_RECENT_DOCS`, 0
 turns it off) and listed on later turns, so "the doc" keeps working, also after
 a share that did not @mention the agent. The `live_doc_*` hint appears only
 when `nc-live` is configured for Talk (`NEXTCLOUD_TALK_LIVE_DOCS=auto`, the
