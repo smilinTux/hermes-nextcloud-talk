@@ -259,9 +259,10 @@ def write_file(dav: Dav, user: str, rts: List[Dict[str, Any]], rel: Any, content
         raise WorkspaceError("the file is open in the editor (locked); try again when it is closed")
     if st >= 300:
         raise WorkspaceError(f"could not write the file (HTTP {st})")
-    fid = {k.lower(): v for k, v in (h or {}).items()}.get("oc-fileid", "")
+    # OC-FileId is "<fileid>oc<instance id>"; links take the number.
+    m = re.match(r"\d+", str({k.lower(): v for k, v in (h or {}).items()}.get("oc-fileid", "")))
     return {"path": shown(root, inner, len(rts) > 1), "mode": mode, "chars": len(text),
-            "fileid": str(fid), "created": st == 201}
+            "fileid": m.group(0) if m else "", "created": st == 201}
 
 
 def http_transport(server: str, user: str, password: str, timeout: float = 30.0) -> Tuple[Dav, Ocs]:

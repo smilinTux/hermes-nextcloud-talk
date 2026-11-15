@@ -101,7 +101,7 @@ class NC:
             if p.rsplit("/", 1)[0] not in self.dirs:
                 return 409, {}, ""
             self.files[p] = content.decode("utf-8")
-            return (204 if exists else 201), {"OC-FileId": "777"}, ""
+            return (204 if exists else 201), {"OC-FileId": "777oc7o1m10z6z7"}, ""
         return 405, {}, ""
 
     def _row(self, p, is_dir):
@@ -141,7 +141,7 @@ def test_list_read_and_write_inside_the_folder():
     assert [e["name"] for e in listing["entries"]] == ["README.md"] and listing["writable"]
     assert workspace.read_file(nc.dav, AGENT, rts, "README.md")["content"] == "# Workshop\n"
     out = workspace.write_file(nc.dav, AGENT, rts, "notes/day1.md", "hello", "create")
-    assert out["created"] and nc.files[P("notes/day1.md")] == "hello"
+    assert out["created"] and nc.files[P("notes/day1.md")] == "hello" and out["fileid"] == "777"
     with pytest.raises(workspace.WorkspaceError, match="already exists"):
         workspace.write_file(nc.dav, AGENT, rts, "notes/day1.md", "again", "create")
     workspace.write_file(nc.dav, AGENT, rts, "notes/day1.md", "more", "append")
@@ -353,6 +353,7 @@ def test_approver_thumbs_up_runs_the_write(tmp_path):
     _react(a, "\U0001F44D", "dknestri")
     assert nc.files[P("plan.md")] == "Step 1" and _status(a) == "approved"
     assert "Approved by Dknestri" in posts[-1]["message"] and posts[-1]["replyTo"] == 6001
+    assert posts[-1]["message"].endswith("/index.php/f/777")
     assert a.handled_events == []
     _react(a, "\U0001F44D", "dknestri", msg_id=7002)   # a second tap changes nothing
     assert len(nc.writes()) == 1
