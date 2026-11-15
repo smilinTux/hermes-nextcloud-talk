@@ -200,7 +200,10 @@ def test_register_tools_gated():
     server = [k for k in seen if k["toolset"] == "nctalk-server"]
     assert [k["name"] for k in polls] == ["talk_poll_create", "talk_poll_status", "talk_poll_close"]
     assert [k["name"] for k in server] == ["talk_message_schedule", "nextcloud_ocs_call"]
-    assert len(seen) == 12
+    room_read = [k for k in seen if k["toolset"] == "nctalk-room-read"]
+    assert [k["name"] for k in room_read] == ["talk_room_history", "talk_room_threads", "talk_room_files"]
+    assert all(k["check_fn"] is ct.room_read_tools_enabled and "guest_guard" not in k for k in room_read)
+    assert len(seen) == 15
     assert all(k["check_fn"] is ct.poll_tools_enabled for k in polls)
     assert all(k["check_fn"] is ct.server_tools_enabled for k in server)
     assert all(k["check_fn"] is ct.tools_enabled for k in calls)

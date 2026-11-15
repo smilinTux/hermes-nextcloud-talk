@@ -13,6 +13,9 @@ rather than by hand in ``~/.hermes/.env``. YAML or JSON, default path
       x7cppncn:
         users: [someone]   # added to the lists above, in this room only
         only: false        # true: in this room ONLY these users (plus agents)
+        guest_tools: [history, threads, files]   # optional: read tools a NON-owner
+                           # allowed here may use, locked to this room (needs
+                           # Hermes guest grants; see README "Guest read tools")
 
 Ids compare case-insensitively. A federated person is ``user@their-server``.
 
@@ -34,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 ACCESS_FILE_ENV = "NEXTCLOUD_TALK_ACCESS_FILE"
 RECHECK_SECONDS = 5.0
+# Room-locked read tools a room rule may open to non-owners (``guest_tools``).
+GUEST_TOOL_GROUPS = ("history", "threads", "files")
 
 
 def default_path(username: str = "") -> str:
@@ -78,7 +83,9 @@ def parse(text: str) -> Dict[str, Any]:
     rooms: Dict[str, Dict[str, Any]] = {}
     for token, spec in (data.get("rooms") or {}).items():
         spec = spec if isinstance(spec, dict) else {"users": spec}
-        rooms[str(token)] = {"users": _ids(spec.get("users")), "only": bool(spec.get("only"))}
+        groups = {g.lower() for g in _ids(spec.get("guest_tools"))}
+        rooms[str(token)] = {"users": _ids(spec.get("users")), "only": bool(spec.get("only")),
+                             "guest_tools": [g for g in GUEST_TOOL_GROUPS if g in groups]}
     return {"users": _ids(data.get("users")), "agents": _ids(data.get("agents")), "rooms": rooms}
 
 
@@ -225,6 +232,12 @@ class TalkAccess:
         if not (rule and rule.get("only")):
             people |= {u.lower() for u in spec["users"]}
         return uid in people or uid in agents
+
+    def guest_tools(self, room: Optional[str]) -> FrozenSet[str]:
+        """Read-tool groups this room opens to non-owners (empty without an access file or a rule)."""
+        if self._spec is None or not room:
+            return frozenset()
+        return frozenset((self._spec["rooms"].get(room) or {}).get("guest_tools") or ())
 
     def is_agent(self, user_id: Optional[str]) -> bool:
         """True when the access file lists this id under ``agents:``."""

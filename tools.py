@@ -803,6 +803,224 @@ TALK_THREAD_CLOSE_SCHEMA = {
     },
 }
 
+# ------------------------------------------------------------ guest reads
+# Read-only tools for THIS room, usable by a non-owner (a room guest) when the access
+# file's room rule lists them under ``guest_tools`` and Hermes has the plugin guest grant
+# (``plugins.entries.<id>.allow_guest_tools: true``). They take no room argument at all:
+# the room is always the bound turn's, so a guest can never point them at another room
+# through the agent's account. They show only what any member of the room can already
+# see in Talk: its messages, its threads, the files shared into it.
+ROOM_READ_TOOLSET = "nctalk-room-read"
+ROOM_READ_ENABLE_ENV = "NEXTCLOUD_TALK_ROOM_READ_TOOLS"
+_SHARES_PATH = "/ocs/v2.php/apps/spreed/api/v1/chat/{room}/share"
+HISTORY_MAX = 100
+HISTORY_TEXT_MAX = 2000
+FILES_MAX = 100
+_ELSEWHERE_KEYS = ("room", OVERRIDE_ARG, "token", "chat_id")
+_access_cache: dict = {}
+
+
+def room_read_tools_enabled() -> bool:
+    """On with the thread tools, unless NEXTCLOUD_TALK_ROOM_READ_TOOLS=off."""
+    if _env(ROOM_READ_ENABLE_ENV, "on").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    return thread_tools_enabled()
+
+
+def _access():
+    """The agent's talk-access file (same path rules as the adapter), reloaded when it changes."""
+    mod = _load_user("access")
+    path = _env(mod.ACCESS_FILE_ENV, "") or mod.default_path(_env("NEXTCLOUD_TALK_USERNAME", ""))
+    acc = _access_cache.get(path)
+    if acc is None:
+        acc = _access_cache[path] = mod.TalkAccess(path)
+    acc.reload()
+    return acc
+
+
+def _guest_guard(group: str):
+    """Hermes guest guard for one tool group: allow a non-owner call only from a Talk room
+    whose access-file rule lists ``group`` under guest_tools, by a person allowed in that
+    room, with no argument that could aim the call elsewhere."""
+    def guard(turn, args) -> bool:
+        room = str(getattr(turn, "chat_id", "") or "")
+        if str(getattr(turn, "platform", "")).lower() != PLATFORM or not ROOM_RE.fullmatch(room):
+            return False
+        if room != current_room():
+            return False
+        if any(str((args or {}).get(k) or "").strip() for k in _ELSEWHERE_KEYS):
+            return False
+        acc = _access()
+        if acc.source != "file":
+            return False  # guest reads need an explicit access file, never the env list
+        return group in acc.guest_tools(room) and acc.allowed(getattr(turn, "user_id", ""), room)
+    guard.__name__ = f"nctalk_guest_guard_{group}"
+    return guard
+
+
+def _this_room() -> tuple[str, Optional[str]]:
+    room = current_room()
+    if not room:
+        return "", "this tool works only from a Nextcloud Talk room, on that room"
+    return room, None
+
+
+def _limit(args: dict, default: int, cap: int) -> int:
+    try:
+        return max(1, min(cap, int((args or {}).get("limit") or default)))
+    except (TypeError, ValueError):
+        return default
+
+
+_PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z0-9_-]+)\}")
+
+
+def _render(text: str, params: Any) -> str:
+    """Talk rich text to plain: ``{mention-user1}`` -> ``@Name``, ``{file}`` -> ``[file: name]``."""
+    params = params if isinstance(params, dict) else {}
+
+    def one(m: "re.Match[str]") -> str:
+        p = params.get(m.group(1))
+        if not isinstance(p, dict):
+            return m.group(0)
+        name = str(p.get("name") or p.get("id") or "")
+        return f"[file: {name}]" if p.get("type") == "file" else f"@{name}"
+    out = _PLACEHOLDER_RE.sub(one, text or "")
+    if "{file}" not in (text or "") and isinstance(params.get("file"), dict):
+        out = f"{out} [file: {params['file'].get('name') or 'file'}]".strip()
+    return out
+
+
+def talk_room_history(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    room, err = _this_room()
+    if err:
+        return _result(error=err)
+    params: dict = {"lookIntoFuture": 0, "setReadMarker": 0, "includeLastKnown": 0,
+                    "limit": _limit(args, 30, HISTORY_MAX)}
+    before = str(args.get("before_id") or "").strip()
+    if before.isdigit():
+        params["lastKnownMessageId"] = int(before)
+    thread = str(args.get("thread_id") or "").strip()
+    if thread.isdigit():
+        params["threadId"] = int(thread)
+    try:
+        status, data = _request("GET", _CHAT_PATH.format(room=room), params=params)
+    except Exception as e:
+        return _result(error=f"could not read this room's history: {e}")
+    if status == 304:
+        return _result(room=room, messages=[], note="no older messages")
+    if status >= 300 or not isinstance(data, list):
+        return _result(error=f"could not read this room's history: HTTP {status}")
+    messages = []
+    for m in data:
+        if not isinstance(m, dict) or m.get("systemMessage") or m.get("messageType") not in (
+                None, "comment", "voice-message"):
+            continue
+        text = " ".join(_render(str(m.get("message") or ""), m.get("messageParameters")).split())
+        if not text:
+            continue
+        item = {"id": m.get("id"), "time": m.get("timestamp"),
+                "author": m.get("actorDisplayName") or m.get("actorId") or "",
+                "text": text[:HISTORY_TEXT_MAX]}
+        if m.get("isThread"):
+            item["thread_id"] = str(m.get("threadId") or "")
+        messages.append(item)
+    messages.sort(key=lambda x: int(x["id"] or 0))
+    out = {"room": room, "messages": messages}
+    if messages:
+        out["older_before_id"] = str(messages[0]["id"])
+    return _result(**out)
+
+
+def talk_room_threads(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    room, err = _this_room()
+    if err:
+        return _result(error=err)
+    if not room_has_threads(room):
+        return _result(error=_NO_THREADS)
+    try:
+        status, data = _request("GET", _RECENT_PATH.format(room=room),
+                                params={"limit": _limit(args, 20, THREAD_LIST_MAX)})
+    except Exception as e:
+        return _result(error=f"could not list threads: {e}")
+    if status >= 300 or not isinstance(data, list):
+        return _result(error=f"could not list threads: HTTP {status}")
+    threads = []
+    for item in data:
+        t = (item or {}).get("thread") or {}
+        threads.append({"thread_id": str(t.get("id")), "title": t.get("title") or "",
+                        "replies": t.get("numReplies") or 0, "last_activity": t.get("lastActivity")})
+    return _result(room=room, threads=threads)
+
+
+def talk_room_files(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    room, err = _this_room()
+    if err:
+        return _result(error=err)
+    try:
+        status, data = _request("GET", _SHARES_PATH.format(room=room),
+                                params={"objectType": "file", "limit": _limit(args, 30, FILES_MAX)})
+    except Exception as e:
+        return _result(error=f"could not list this room's files: {e}")
+    if status >= 300 or not isinstance(data, (dict, list)):
+        return _result(error=f"could not list this room's files: HTTP {status}")
+    items = data.values() if isinstance(data, dict) else data
+    files = []
+    for m in items:
+        f = ((m or {}).get("messageParameters") or {}).get("file") if isinstance(m, dict) else None
+        if not isinstance(f, dict):
+            continue
+        files.append({"name": _one_line(f.get("name"), 200), "fileid": str(f.get("id") or ""),
+                      "link": f.get("link") or "", "mimetype": f.get("mimetype") or "",
+                      "shared_by": m.get("actorDisplayName") or m.get("actorId") or "",
+                      "time": m.get("timestamp"), "message_id": m.get("id")})
+    files.sort(key=lambda x: int(x["message_id"] or 0), reverse=True)
+    return _result(room=room, files=files)
+
+
+_ROOM_ONLY = (" Works only on THIS chat's room; there is no room argument, it cannot read "
+              "any other room.")
+TALK_ROOM_HISTORY_SCHEMA = {
+    "name": "talk_room_history",
+    "description": (
+        "Read recent messages of this Nextcloud Talk room (main timeline, or one thread with "
+        "thread_id), oldest first: id, time, author, text. Use it when someone refers to "
+        "something said earlier here that you do not have, e.g. links or docs from a past "
+        "meeting. Page back with before_id = older_before_id." + _ROOM_ONLY),
+    "parameters": {"type": "object", "properties": {
+        "limit": {"type": "integer", "description": "How many messages (default 30, max 100)."},
+        "thread_id": {"type": "string", "description": "Only this thread of the room."},
+        "before_id": {"type": "string", "description": "Only messages older than this id."},
+    }},
+}
+TALK_ROOM_THREADS_SCHEMA = {
+    "name": "talk_room_threads",
+    "description": ("List the threads in this Nextcloud Talk room, most recently active first: "
+                    "thread_id, title, replies, last activity. Read one with talk_room_history "
+                    "thread_id." + _ROOM_ONLY),
+    "parameters": {"type": "object", "properties": {
+        "limit": {"type": "integer", "description": "How many threads (default 20, max 50)."},
+    }},
+}
+TALK_ROOM_FILES_SCHEMA = {
+    "name": "talk_room_files",
+    "description": ("List the files shared into this Nextcloud Talk room, newest first: name, "
+                    "fileid, link, type, who shared it and when. Use it to find a document "
+                    "someone shared here." + _ROOM_ONLY),
+    "parameters": {"type": "object", "properties": {
+        "limit": {"type": "integer", "description": "How many files (default 30, max 100)."},
+    }},
+}
+ROOM_READ_TOOLS = (
+    ("talk_room_history", TALK_ROOM_HISTORY_SCHEMA, talk_room_history, "📜", "history"),  # scroll
+    ("talk_room_threads", TALK_ROOM_THREADS_SCHEMA, talk_room_threads, "🗂️", "threads"),  # dividers
+    ("talk_room_files", TALK_ROOM_FILES_SCHEMA, talk_room_files, "📎", "files"),  # paperclip
+)
+
+
 THREAD_TOOLS = (
     ("talk_thread_start", TALK_THREAD_START_SCHEMA, talk_thread_start, "🧵"),  # thread
     ("talk_thread_reply", TALK_THREAD_REPLY_SCHEMA, talk_thread_reply, "💬"),  # speech balloon
@@ -1497,6 +1715,16 @@ SERVER_TOOLS = (
 )
 
 
+def _supports_guest_guard(ctx) -> bool:
+    """True when this Hermes accepts ``register_tool(..., guest_guard=)`` (plugin guest grants).
+    Older cores: the room-read tools still register, owner-only."""
+    import inspect
+    try:
+        return "guest_guard" in inspect.signature(ctx.register_tool).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def register_tools(ctx) -> None:
     """Register the call tools (``nctalk-calls``, gated on NEXTCLOUD_TALK_CALL_TOOLS) and the
     thread tools (``nctalk-threads``, on in user mode unless NEXTCLOUD_TALK_THREAD_TOOLS=off)."""
@@ -1512,5 +1740,11 @@ def register_tools(ctx) -> None:
     for name, schema, handler, emoji in SERVER_TOOLS:
         ctx.register_tool(name=name, toolset=CAPS_TOOLSET, schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji, check_fn=server_tools_enabled)
+    guests = _supports_guest_guard(ctx)
+    for name, schema, handler, emoji, group in ROOM_READ_TOOLS:
+        extra = {"guest_guard": _guest_guard(group)} if guests else {}
+        ctx.register_tool(name=name, toolset=ROOM_READ_TOOLSET, schema=schema, handler=handler,
+                          description=schema["description"], emoji=emoji,
+                          check_fn=room_read_tools_enabled, **extra)
     # Harmless when the tools are off: check_fn drops them before tool_search sees them.
     pin_visible()
