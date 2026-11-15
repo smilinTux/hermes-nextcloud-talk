@@ -907,6 +907,12 @@ def _mentions_someone_else(
     for key, param in (message_parameters or {}).items():
         if not isinstance(param, dict) or param.get("type") not in _OTHER_MENTION_TYPES:
             continue
+        if not str(key).startswith("mention-"):
+            # Talk keys every mention ``mention-<type><n>``. Other rich
+            # parameters are metadata: every file share carries an ``actor``
+            # (``type: user``, the sender), which made a guest's own share read
+            # as "for someone else" and dropped it (Workshop, 2026-11-14).
+            continue
         pid = str(param.get("id") or "").casefold()
         if not pid or pid == own or pid.split("@", 1)[0] == own:
             continue
@@ -1640,7 +1646,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         docs = livedocs.docs_from_parameters(message.get("messageParameters"))
         known = {d["id"] for d in docs}
         docs += [d for d in livedocs.docs_from_links(text, self._server) if d["id"] not in known]
-        if self._sender_allowed(actor.get("id")):
+        if self._sender_allowed(actor.get("id"), token):
             # Same filter as the context backlog: an unlisted sender's share
             # never becomes "the doc" for someone else's later turn.
             self._recent_docs.note(token, reversed(docs))
@@ -2072,7 +2078,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         """
         if self._context_messages <= 0:
             return
-        if not self._sender_allowed(actor.get("id")):
+        if not self._sender_allowed(actor.get("id"), token):
             # Same filter as watch digests: an unlisted sender's text never
             # rides into a later turn as room context.
             return
@@ -2279,7 +2285,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 continue
             actor = _extract_actor(m)
             mine = self._is_self(actor)
-            if not mine and not self._sender_allowed(actor.get("id")):
+            if not mine and not self._sender_allowed(actor.get("id"), token):
                 continue
             text = _resolve_mention_placeholders((m.get("message") or "").strip(), m.get("messageParameters"))
             if not text:
@@ -2664,7 +2670,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         from senders outside the allowlist are dropped before the digest is
         built; the digest is attributed to the last allowed sender.
         """
-        allowed = [e for e in events if self._sender_allowed(e.source.user_id)]
+        allowed = [e for e in events if self._sender_allowed(e.source.user_id, token)]
         if not allowed:
             return
         digest_text = "\n".join(f"- {e.source.user_name or e.source.user_id}: {e.text}" for e in allowed)

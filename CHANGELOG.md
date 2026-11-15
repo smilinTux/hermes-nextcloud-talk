@@ -4,6 +4,23 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.15.1] - 2026-11-14
+
+### Fixed
+
+- A file share no longer counts as an @mention of its own sender (user mode).
+  Talk puts an `actor` rich parameter (`type: user`, the sender) on every file
+  share, and the free-room gate counted it as "mentions someone else". So in
+  a `free` room a person's file share (bare or with a caption) became context
+  only and took no turn. Only `mention-*` parameters count as mentions now.
+  Live 2026-11-14: a room guest's two shares in the Workshop room reached no
+  one, with nothing logged.
+- A room-only grant in the access file (`rooms: <token>: {users: [...]}`) now
+  counts everywhere the adapter filters senders, not only at intake. The
+  context backlog, the room's recent shared docs, thread-resume history and
+  watch digests checked the sender without the room, so a room guest's
+  lines were silently left out of the next turn's context.
+
 ## [1.15.0] - 2026-11-12
 
 ### Added
