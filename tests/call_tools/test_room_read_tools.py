@@ -182,7 +182,11 @@ def test_registration_passes_guards_only_to_a_core_that_takes_them():
 
     ct.register_tools(NewCore())
     guarded = {n: g for n, g in seen if g is not None}
-    assert set(guarded) == {"talk_room_history", "talk_room_threads", "talk_room_files"}
+    assert set(guarded) == {"talk_room_history", "talk_room_threads", "talk_room_files",
+                            "talk_workspace_list", "talk_workspace_read", "talk_workspace_write",
+                            "talk_ask_owner"}
+    assert guarded["talk_workspace_write"].__name__ == "nctalk_guest_guard_workspace"
+    assert guarded["talk_ask_owner"].__name__ == "nctalk_guest_guard_ask"
     assert guarded["talk_room_files"].__name__ == "nctalk_guest_guard_files"
 
 

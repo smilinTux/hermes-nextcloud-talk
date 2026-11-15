@@ -108,13 +108,14 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 
 try:  # package import (plugin and tests both load ``user`` as a package)
-    from . import access, livedocs, pollstate, textstyle, threadsmode
+    from . import access, livedocs, pollstate, textstyle, threadsmode, workspace
 except ImportError:  # pragma: no cover - loaded as a loose module
     import access  # type: ignore
     import livedocs  # type: ignore
     import pollstate  # type: ignore
     import textstyle  # type: ignore
     import threadsmode  # type: ignore
+    import workspace  # type: ignore
 # Platform id. Not ``nextcloud_talk``: another author's Talk plugin in the
 # Hermes catalog registers that id, and two plugins claiming one id silently
 # replace each other. Env var names keep the NEXTCLOUD_TALK_ prefix.
@@ -343,6 +344,8 @@ POLLS_HINT = (
 REACTION_TURNS_ENV = "NEXTCLOUD_TALK_REACTION_TURNS"
 DEFAULT_REACTION_TURNS = "✅,❌"  # check mark, cross
 YES_REACTIONS = frozenset({"✅", "\U0001F44D", "✔️", "✔"})
+# A "no" on an approval request (talk_workspace_write / talk_ask_owner from a guest's turn).
+APPROVAL_NO = frozenset({"\U0001F44E", "❌", "✖"})
 # Server capabilities: re-read daily, told to the model once per conversation.
 CAPS_REFRESH_SECONDS = 24 * 3600.0
 CAPS_NOTE_ENV = "NEXTCLOUD_TALK_CAPABILITY_NOTE"
@@ -2408,6 +2411,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         parent_id = str(parent.get("id") or "")
         if not parent_id:
             return
+        if await self._maybe_approval(token, parent_id, actor, emoji):
+            return
         if pollstate.keycap_index(emoji) is not None:
             recs = pollstate.find(store, room=token, kind="reaction", message_id=parent_id)
             if recs:
@@ -2422,6 +2427,103 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if not self._is_self(_extract_actor(parent)):
             return  # a reaction on someone else's message is not an answer to us
         await self._dispatch_reaction_turn(token, message, parent, actor, emoji, msg_id)
+
+    def _is_approver(self, token: str, actor: Dict[str, Optional[str]]) -> bool:
+        """May ``actor`` approve requests in ``token``? The access file's approvers (room,
+        else defaults); without any, the Hermes owner check for this room. Fails closed."""
+        uid = str(actor.get("id") or "").strip().lower()
+        if uid.startswith("federated_users/"):
+            uid = uid[len("federated_users/"):]
+        if not uid:
+            return False
+        ids = self._access.approvers(token)
+        if ids:
+            return uid in ids
+        try:
+            from tools.session_scope import source_is_owner  # type: ignore
+        except Exception:
+            return False
+        room = self._room_meta.get(token, {})
+        try:
+            src = self.build_source(chat_id=token, chat_type=_room_chat_type(room.get("type")),
+                                    user_id=actor.get("id"))
+            return source_is_owner(src) is True
+        except Exception:
+            return False
+
+    def _approved_write(self, token: str, rec: Dict[str, Any]) -> Dict[str, Any]:
+        """Run an approved workspace write (blocking: called in a worker thread)."""
+        dav, ocs = (getattr(self, "_ws_transport", None)
+                    or workspace.http_transport(self._server, self._username, self._app_password))
+        rts = workspace.roots(ocs, token, self._username)
+        return workspace.write_file(dav, self._username, rts, rec.get("path"), rec.get("content"),
+                                    rec.get("mode") or "create")
+
+    async def _approval_note(self, token: str, parent_id: str, text: str) -> None:
+        if self._http_client is None:
+            return
+        body: Dict[str, Any] = {"message": textstyle.tidy(text)}
+        try:
+            body["replyTo"] = int(parent_id)  # lands in the request's thread, if it has one
+        except (TypeError, ValueError):
+            pass
+        try:
+            await self._http_client.post(f"/ocs/v2.php/apps/spreed/api/v1/chat/{token}",
+                                         params={"format": "json"}, json=body)
+        except Exception as e:
+            logger.warning("[%s] approval note in %s failed: %s", self.name, token, e)
+
+    async def _maybe_approval(self, token: str, parent_id: str, actor: Dict[str, Optional[str]],
+                              emoji: str) -> bool:
+        """Handle a reaction on one of our approval requests. True when ``parent_id`` is one
+        (even if the reaction does not count), so nothing else treats it as an answer."""
+        store = self._poll_store()
+        recs = pollstate.find(store, room=token, kind="approval", message_id=parent_id)
+        if not recs:
+            return False
+        bare = emoji.replace("\ufe0f", "")
+        yes = bare in {e.replace("\ufe0f", "") for e in YES_REACTIONS}
+        no = bare in APPROVAL_NO
+        if not (yes or no):
+            return True
+        if not self._is_approver(token, actor):
+            logger.info("[%s] room %s: %s reacted %s on approval %s but is not an approver",
+                        self.name, token, actor.get("id"), emoji, parent_id)
+            return True
+        rec = pollstate.claim(store, recs[0]["key"], "approved" if yes else "declined",
+                              decided_by=actor.get("id"))
+        if rec is None:
+            return True  # already decided
+        who = actor.get("display_name") or actor.get("id") or "An approver"
+        asker = rec.get("requester_name") or rec.get("requester") or "the guest"
+        logger.info("[%s] approval %s in %s: %s by %s (asked by %s)", self.name, parent_id, token,
+                    "approved" if yes else "declined", actor.get("id"), rec.get("requester"))
+        if no:
+            await self._approval_note(token, parent_id, f"\U0001F44E {who} declined {asker}'s request.")
+            return True
+        if rec.get("action") == "write":
+            try:
+                out = await asyncio.to_thread(self._approved_write, token, rec)
+            except Exception as e:
+                pollstate.update(store, rec["key"], status="failed", error=str(e)[:300])
+                await self._approval_note(token, parent_id,
+                                          f"{who} approved, but the write failed: {e}")
+                return True
+            link = f" {self._server}/index.php/f/{out['fileid']}" if out.get("fileid") else ""
+            logger.info("[%s] workspace write room=%s path=%s mode=%s by=%s approved_by=%s",
+                        self.name, token, out.get("path"), out.get("mode"), rec.get("requester"),
+                        actor.get("id"))
+            await self._approval_note(token, parent_id,
+                                      f"✅ Approved by {who}: {out.get('path')} is saved for {asker}.{link}")
+            return True
+        if rec.get("action") == "task":
+            text = (f"[Approved request] {who} approved this request from {asker} in this room: "
+                    f"\"{rec.get('task') or ''}\". Do it now with your tools, then say in one line "
+                    f"what you did (links if any). If something in it is unclear or risky, ask {who} "
+                    f"first instead.")
+            event = self._event_for(token, actor, text, parent_id, rec.get("thread") or None)
+            await self.handle_message(event)
+        return True
 
     def _event_for(self, token: str, actor: Dict[str, Optional[str]], text: str,
                    message_id: Optional[str], thread_id: Optional[str]) -> MessageEvent:

@@ -15,7 +15,15 @@ rather than by hand in ``~/.hermes/.env``. YAML or JSON, default path
         only: false        # true: in this room ONLY these users (plus agents)
         guest_tools: [history, threads, files]   # optional: read tools a NON-owner
                            # allowed here may use, locked to this room (needs
-                           # Hermes guest grants; see README "Guest read tools")
+                           # Hermes guest grants; see README "Guest read tools").
+                           # Also: workspace (this room's shared folder), ask
+                           # (ask an approver to do something)
+        approval: required # optional: overrides defaults.approval for this room
+        approvers: [dknestri]  # optional: overrides defaults.approvers
+    defaults:              # optional, for every room without its own value
+      approval: required   # required: a guest's workspace write waits for an
+                           # approver's thumbs up; off: it writes at once
+      approvers: [dknestri]  # who may approve; empty = the Hermes owner(s)
 
 Ids compare case-insensitively. A federated person is ``user@their-server``.
 
@@ -38,7 +46,9 @@ logger = logging.getLogger(__name__)
 ACCESS_FILE_ENV = "NEXTCLOUD_TALK_ACCESS_FILE"
 RECHECK_SECONDS = 5.0
 # Room-locked read tools a room rule may open to non-owners (``guest_tools``).
-GUEST_TOOL_GROUPS = ("history", "threads", "files")
+GUEST_TOOL_GROUPS = ("history", "threads", "files", "workspace", "ask")
+# ``approval``: does a guest's workspace write wait for an approver? Unset anywhere = required.
+APPROVAL_VALUES = ("required", "off")
 
 
 def default_path(username: str = "") -> str:
@@ -64,6 +74,11 @@ def _ids(raw: Any) -> List[str]:
     return out
 
 
+def _norm(uid: Any) -> str:
+    s = str(uid or "").strip().lower()
+    return s[len("federated_users/"):] if s.startswith("federated_users/") else s
+
+
 def parse(text: str) -> Dict[str, Any]:
     """Parse the file body (YAML when PyYAML is present, else JSON) into a normalized dict."""
     data: Any = None
@@ -85,8 +100,23 @@ def parse(text: str) -> Dict[str, Any]:
         spec = spec if isinstance(spec, dict) else {"users": spec}
         groups = {g.lower() for g in _ids(spec.get("guest_tools"))}
         rooms[str(token)] = {"users": _ids(spec.get("users")), "only": bool(spec.get("only")),
-                             "guest_tools": [g for g in GUEST_TOOL_GROUPS if g in groups]}
-    return {"users": _ids(data.get("users")), "agents": _ids(data.get("agents")), "rooms": rooms}
+                             "guest_tools": [g for g in GUEST_TOOL_GROUPS if g in groups],
+                             "approval": _approval(spec.get("approval")),
+                             "approvers": _ids(spec.get("approvers")) if "approvers" in spec else None}
+    defaults = data.get("defaults") if isinstance(data.get("defaults"), dict) else {}
+    return {"users": _ids(data.get("users")), "agents": _ids(data.get("agents")), "rooms": rooms,
+            "defaults": {"approval": _approval(defaults.get("approval")),
+                         "approvers": _ids(defaults.get("approvers"))}}
+
+
+def _approval(raw: Any) -> Optional[str]:
+    """``required`` / ``off`` (booleans and on/yes read as required), None when unset.
+    Anything unrecognised is ``required``: a typo never turns approvals off."""
+    if raw is None:
+        return None
+    if raw is False or str(raw).strip().lower() in ("off", "false", "no", "none", "direct"):
+        return "off"
+    return "required"
 
 
 def _scalar(raw: str) -> Any:
@@ -238,6 +268,26 @@ class TalkAccess:
         if self._spec is None or not room:
             return frozenset()
         return frozenset((self._spec["rooms"].get(room) or {}).get("guest_tools") or ())
+
+    def approval_required(self, room: Optional[str]) -> bool:
+        """Does a guest's workspace write in ``room`` wait for an approver? The room's
+        ``approval``, else ``defaults.approval``, else required."""
+        if self._spec is None:
+            return True
+        rule = self._spec["rooms"].get(room or "") or {}
+        value = rule.get("approval") or self._spec["defaults"]["approval"]
+        return value != "off"
+
+    def approvers(self, room: Optional[str]) -> FrozenSet[str]:
+        """Who may approve a request in ``room`` (lowercase): the room's ``approvers`` when it
+        sets them, else ``defaults.approvers``. Empty: the caller falls back to the Hermes owner."""
+        if self._spec is None:
+            return frozenset()
+        rule = self._spec["rooms"].get(room or "") or {}
+        ids = rule.get("approvers")
+        if ids is None:
+            ids = self._spec["defaults"]["approvers"]
+        return frozenset(_norm(i) for i in ids)
 
     def is_agent(self, user_id: Optional[str]) -> bool:
         """True when the access file lists this id under ``agents:``."""

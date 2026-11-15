@@ -37,6 +37,7 @@ Hermes loader can pre-register these tools in CLI/TUI processes.
 
 from __future__ import annotations
 
+import logging
 import json
 import os
 import re
@@ -57,6 +58,8 @@ EXIT_ALREADY_IN_CALL = "3"
 
 # Swappable in tests.
 Runner = Callable[[List[str]], "subprocess.CompletedProcess[str]"]
+
+logger = logging.getLogger(__name__)
 
 
 def _default_run(cmd: List[str]) -> "subprocess.CompletedProcess[str]":
@@ -1021,6 +1024,238 @@ ROOM_READ_TOOLS = (
 )
 
 
+# --------------------------------------------------------- room workspace
+# The room's workspace is the folder(s) the agent's account shared into this room (see
+# user/workspace.py). Guests the access file allows (``guest_tools: [workspace]``) may list,
+# read, create and edit text files there; nothing deletes, moves or shares. Whether a GUEST's
+# write waits for an approver is the access file's ``approval`` (room, else ``defaults``, else
+# required). An owner turn writes at once. ``talk_ask_owner`` (group ``ask``) lets a guest ask
+# an approver for anything else: the approver's thumbs up runs it as the approver's own turn.
+WORKSPACE_TOOLSET = "nctalk-workspace"
+APPROVAL_MARK = "\U0001F510"  # closed lock with key, leads an approval request
+APPROVAL_PREVIEW = 400
+ASK_MAX = 2000
+_ws_transport_override = None  # tests: (dav, ocs)
+
+
+def _ws():
+    return _load_user("workspace")
+
+
+def _ws_transport():
+    if _ws_transport_override is not None:
+        return _ws_transport_override
+    server, user, password = _talk_credentials()
+    return _ws().http_transport(server, user, password)
+
+
+def _ws_roots(room: str):
+    dav, ocs = _ws_transport()
+    return dav, _ws().roots(ocs, room, _talk_credentials()[1])
+
+
+def _is_owner_turn() -> bool:
+    """True only for a Hermes owner turn; anything uncertain is a guest (fail closed)."""
+    try:
+        from tools.session_scope import is_owner_session  # type: ignore
+    except Exception:
+        return False
+    try:
+        return is_owner_session() is True
+    except Exception:
+        return False
+
+
+def _requester() -> tuple[str, str]:
+    uid = _session("HERMES_SESSION_USER_ID").strip()
+    return uid, (_session("HERMES_SESSION_USER_NAME").strip() or uid or "a guest")
+
+
+def _owner_ids() -> list:
+    """Talk ids in HERMES_MEMORY_OWNER (``nctalk:`` / ``nextcloud_talk:`` entries)."""
+    out = []
+    for item in _env("HERMES_MEMORY_OWNER", "").split(","):
+        plat, _, uid = item.strip().partition(":")
+        if plat.lower() in ("nctalk", PLATFORM, "nextcloud_talk") and uid.strip():
+            out.append(uid.strip().lower())
+    return out
+
+
+def approver_ids(room: str) -> list:
+    """Who may approve in ``room``: the access file's approvers, else the Hermes owner(s)."""
+    ids = sorted(_access().approvers(room))
+    return ids or _owner_ids()
+
+
+def _mentions(ids: list) -> str:
+    local = [i for i in ids if "@" not in i]  # federated ids cannot be @-mentioned this way
+    return " ".join(f'@"{i}"' for i in local)
+
+
+def _queue_approval(room: str, action: str, summary: str, detail: str, fields: dict) -> str:
+    """Post an approval request in this room (and thread) and remember it for the adapter."""
+    ids = approver_ids(room)
+    if not ids:
+        return _result(error="nobody can approve requests in this room yet (no approvers in the "
+                             "access file and no Hermes owner set); ask the owner directly")
+    uid, name = _requester()
+    who = _mentions(ids) or "an approver"
+    text = (f"{APPROVAL_MARK} Approval needed: {name} asks to {summary}\n\n{detail}\n\n"
+            f"{who}: react \U0001F44D to approve or \U0001F44E to decline.").strip()
+    body: dict = {"message": text}
+    thread = current_thread()
+    if thread.isdigit():
+        body["threadId"] = int(thread)
+    mid, err = _post_chat(room, body)
+    if err or not mid:
+        return _result(error=f"could not post the approval request: {err or 'no message id'}")
+    ps = _pollstate()
+    ps.add(_poll_store(), {"key": ps.record_key("approval", room, mid), "kind": "approval",
+                           "room": room, "thread": thread if thread.isdigit() else "",
+                           "message_id": mid, "action": action, "summary": summary,
+                           "requester": uid, "requester_name": name, **fields})
+    logger.info("[nctalk] approval requested room=%s msg=%s action=%s by=%s", room, mid, action, uid)
+    return _result(ok=True, status="waiting_for_approval", message_id=mid,
+                   approvers=ids, note=("The request is posted in the chat with the approvers "
+                                        "mentioned. Do NOT repeat it. Tell the person in one line "
+                                        "that it waits for an approver's thumbs up; it runs by "
+                                        "itself when approved."))
+
+
+def _ws_call(fn):
+    room, err = _this_room()
+    if err:
+        return _result(error=err)
+    ws = _ws()
+    try:
+        return _result(room=room, **fn(room, ws))
+    except ws.WorkspaceError as e:
+        return _result(error=str(e))
+    except Exception as e:
+        return _result(error=f"workspace request failed: {e}")
+
+
+def talk_workspace_list(args: dict, **_kw: Any) -> str:
+    args = args or {}
+
+    def run(room, ws):
+        dav, rts = _ws_roots(room)
+        return ws.list_dir(dav, _talk_credentials()[1], rts, args.get("path") or "")
+    return _ws_call(run)
+
+
+def talk_workspace_read(args: dict, **_kw: Any) -> str:
+    args = args or {}
+
+    def run(room, ws):
+        dav, rts = _ws_roots(room)
+        return ws.read_file(dav, _talk_credentials()[1], rts, args.get("path"))
+    return _ws_call(run)
+
+
+def talk_workspace_write(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    room, err = _this_room()
+    if err:
+        return _result(error=err)
+    ws = _ws()
+    try:
+        dav, rts = _ws_roots(room)
+        root, inner, text, mode = ws.check_write(rts, args.get("path"), args.get("content"),
+                                                 args.get("mode"))
+        shown = ws.shown(root, inner, len(rts) > 1)
+        owner = _is_owner_turn()
+        uid, _name = _requester()
+        if not owner and _access().approval_required(room):
+            preview = text[:APPROVAL_PREVIEW] + (" [...]" if len(text) > APPROVAL_PREVIEW else "")
+            verb = {"create": "create", "replace": "replace the text of", "append": "add to"}[mode]
+            return _queue_approval(
+                room, "write", f"{verb} {shown} ({len(text)} characters).",
+                "Preview:\n> " + preview.replace("\n", "\n> "),
+                {"path": "/".join([root["name"]] + inner), "mode": mode, "content": text})
+        out = ws.write_file(dav, _talk_credentials()[1], rts, "/".join([root["name"]] + inner),
+                            text, mode)
+        logger.info("[nctalk] workspace write room=%s path=%s mode=%s by=%s owner=%s",
+                    room, shown, mode, uid, owner)
+        return _result(room=room, ok=True, **out)
+    except ws.WorkspaceError as e:
+        return _result(error=str(e))
+    except Exception as e:
+        return _result(error=f"workspace write failed: {e}")
+
+
+def talk_ask_owner(args: dict, **_kw: Any) -> str:
+    args = args or {}
+    room, err = _this_room()
+    if err:
+        return _result(error=err)
+    task = str(args.get("request") or "").strip()[:ASK_MAX]
+    if not task:
+        return _result(error="say what you want done")
+    if _is_owner_turn():
+        return _result(error="this is already an owner turn: just do it (no approval needed)")
+    first = _one_line(task, 160)
+    return _queue_approval(room, "task", f"have me do this: {first}",
+                           ("Full request:\n> " + task.replace("\n", "\n> ")) if len(task) > 160 else "",
+                           {"task": task})
+
+
+_WS_ONLY = (" Works only on the folder(s) shared into THIS chat's room; there is no room "
+            "argument. Paths are relative to that folder (start with the folder name when the "
+            "room has several).")
+TALK_WORKSPACE_LIST_SCHEMA = {
+    "name": "talk_workspace_list",
+    "description": ("List this Nextcloud Talk room's workspace: the folder shared into the room, "
+                    "or a subfolder of it. Use it to find the room's working docs." + _WS_ONLY),
+    "parameters": {"type": "object", "properties": {
+        "path": {"type": "string", "description": "Subfolder; empty for the top."},
+    }},
+}
+TALK_WORKSPACE_READ_SCHEMA = {
+    "name": "talk_workspace_read",
+    "description": ("Read a text file (md, txt, csv, json, yaml, html...) from this room's "
+                    "workspace." + _WS_ONLY),
+    "parameters": {"type": "object", "required": ["path"], "properties": {
+        "path": {"type": "string", "description": "File path inside the room's folder."},
+    }},
+}
+TALK_WORKSPACE_WRITE_SCHEMA = {
+    "name": "talk_workspace_write",
+    "description": (
+        "Create or edit a text file in this room's workspace. mode create makes a new file "
+        "(never overwrites; missing subfolders are made), replace rewrites an existing file "
+        "(read it first and keep what should stay), append adds to the end. Nothing can be "
+        "deleted or moved; old versions stay in Nextcloud. In a guest's turn the room may "
+        "require an approver: then the tool posts the request and returns "
+        "status=waiting_for_approval, and the write happens by itself on the approver's thumbs "
+        "up." + _WS_ONLY),
+    "parameters": {"type": "object", "required": ["path", "content"], "properties": {
+        "path": {"type": "string", "description": "File path inside the room's folder, e.g. notes.md."},
+        "content": {"type": "string", "description": "The text to write (or to add, for append)."},
+        "mode": {"type": "string", "enum": ["create", "replace", "append"],
+                 "description": "Default create."},
+    }},
+}
+TALK_ASK_OWNER_SCHEMA = {
+    "name": "talk_ask_owner",
+    "description": (
+        "In a guest's turn, ask this room's approver (the owner) to let you do something your "
+        "tools here cannot: for example a Deck card, a file outside the room's folder, or an "
+        "email. Write the request so it stands on its own (what, where, the exact content). "
+        "It posts an approval request in the chat; on the approver's thumbs up you get a turn "
+        "as the approver, with their tools, to do it. Not for things you can already do."),
+    "parameters": {"type": "object", "required": ["request"], "properties": {
+        "request": {"type": "string", "description": "The full task, self-contained."},
+    }},
+}
+WORKSPACE_TOOLS = (
+    ("talk_workspace_list", TALK_WORKSPACE_LIST_SCHEMA, talk_workspace_list, "🗄️", "workspace"),
+    ("talk_workspace_read", TALK_WORKSPACE_READ_SCHEMA, talk_workspace_read, "📖", "workspace"),
+    ("talk_workspace_write", TALK_WORKSPACE_WRITE_SCHEMA, talk_workspace_write, "📝", "workspace"),
+    ("talk_ask_owner", TALK_ASK_OWNER_SCHEMA, talk_ask_owner, APPROVAL_MARK, "ask"),
+)
+
+
 THREAD_TOOLS = (
     ("talk_thread_start", TALK_THREAD_START_SCHEMA, talk_thread_start, "🧵"),  # thread
     ("talk_thread_reply", TALK_THREAD_REPLY_SCHEMA, talk_thread_reply, "💬"),  # speech balloon
@@ -1741,6 +1976,11 @@ def register_tools(ctx) -> None:
         ctx.register_tool(name=name, toolset=CAPS_TOOLSET, schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji, check_fn=server_tools_enabled)
     guests = _supports_guest_guard(ctx)
+    for name, schema, handler, emoji, group in WORKSPACE_TOOLS:
+        extra = {"guest_guard": _guest_guard(group)} if guests else {}
+        ctx.register_tool(name=name, toolset=WORKSPACE_TOOLSET, schema=schema, handler=handler,
+                          description=schema["description"], emoji=emoji,
+                          check_fn=room_read_tools_enabled, **extra)
     for name, schema, handler, emoji, group in ROOM_READ_TOOLS:
         extra = {"guest_guard": _guest_guard(group)} if guests else {}
         ctx.register_tool(name=name, toolset=ROOM_READ_TOOLSET, schema=schema, handler=handler,
