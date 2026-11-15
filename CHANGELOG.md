@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.17.1] - 2026-11-14
+
+### Fixed
+
+- The guest toolsets (`nctalk-room-read`, `nctalk-workspace`) are pinned to
+  Hermes' direct tool surface. Deferred behind `tool_search` / `tool_call`,
+  they were unreachable in a guest turn, which may not run those meta-tools.
+
 ## [1.17.0] - 2026-11-14
 
 ### Added

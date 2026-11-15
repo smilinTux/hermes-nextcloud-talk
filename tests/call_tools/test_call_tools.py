@@ -236,7 +236,8 @@ def test_pin_visible_adds_toolset_to_direct_surface(monkeypatch):
     mod = _fake_tool_search(monkeypatch)
     assert ct.pin_visible() is True
     assert mod._DIRECT_SURFACE_TOOLSETS == frozenset(
-        {"project", "desktop_ui", "nctalk-calls", "nctalk-threads", "nctalk-polls", "nctalk-server"})
+        {"project", "desktop_ui", "nctalk-calls", "nctalk-threads", "nctalk-polls", "nctalk-server",
+         "nctalk-room-read", "nctalk-workspace"})
     assert isinstance(mod._DIRECT_SURFACE_TOOLSETS, frozenset)
 
 

@@ -421,7 +421,10 @@ def pin_visible() -> bool:
         import importlib
         ts = importlib.import_module(_TOOL_SEARCH_MODULE)
         current = getattr(ts, _DIRECT_ATTR)
-        wanted = {TOOLSET, THREAD_TOOLSET, POLL_TOOLSET, CAPS_TOOLSET}
+        # The guest toolsets must be direct too: a non-owner turn may not run
+        # tool_search / tool_call, so a deferred guest tool is unreachable there.
+        wanted = {TOOLSET, THREAD_TOOLSET, POLL_TOOLSET, CAPS_TOOLSET,
+                  ROOM_READ_TOOLSET, WORKSPACE_TOOLSET}
         if not wanted <= set(current):
             setattr(ts, _DIRECT_ATTR, frozenset(current) | wanted)
         return True
