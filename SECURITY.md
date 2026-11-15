@@ -73,6 +73,28 @@ no Hermes-level per-user allowlist layered underneath unless you opt in.
   They never write, and they never read other rooms, the agent's files or
   its memory.
 
+## Room workspace and approvals (user mode, v1.17.0)
+
+- The workspace root is re-read from the Sharing API on every call: folders
+  the agent's account OWNS and shared to THIS room (share type 10), outside
+  `Talk/`. Unsharing closes it at once; the share's permissions bound create
+  and edit. Paths are relative and checked before any request: absolute
+  paths, `..`, `.` and hidden segments, backslashes and control characters
+  are refused. Only text file types are read or written.
+- No delete, move, rename or share exists in the tool set. `create` never
+  overwrites (`If-None-Match: *`), `replace` only an existing file, `append`
+  uses the file's etag. Nextcloud keeps the previous versions.
+- Approval is decided by the access file as it is when the reaction
+  arrives: `approvers` for the room, else `defaults.approvers`, else the
+  Hermes owner check for that room. An unrecognised `approval` value counts
+  as required, so a typo never opens writes. A request is claimed once; a
+  second reaction does nothing.
+- An approved write runs the stored path and content, not a new model
+  turn, so what runs is what the request previewed (the preview shows the
+  first 400 characters and the full length). An approved `talk_ask_owner`
+  runs as the approver's own turn: Hermes gives it the approver's scope, and
+  no more.
+
 ## Shared across both modes
 
 - **Message length**: both connectors chunk at Nextcloud Talk's ~32000

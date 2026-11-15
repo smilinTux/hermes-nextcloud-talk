@@ -96,6 +96,45 @@ Without the consent, or on an older Hermes, the tools stay owner-only. The
 access file, `guest_tools` included, is meant to be edited from the
 [Agent Seats](https://github.com/smilinTux/agent-seats) app.
 
+#### Room workspace and approvals (v1.17.0)
+
+A guest can also work in the room's **workspace**: the folder(s) the agent's
+account shared into the room from the Files app (Share, then pick the
+conversation). Not the automatic `Talk/` upload folders, and not folders
+someone else owns.
+
+```yaml
+defaults:                # every room without its own value
+  approval: required     # a guest's write waits for an approver (unset = required)
+  approvers: [chef]      # who may approve; empty = the Hermes owner(s)
+rooms:
+  abcd1234: {users: [carol], guest_tools: [history, threads, files, workspace, ask]}
+  efgh5678: {users: [kid, grandma], guest_tools: [workspace], approval: off}
+```
+
+| group       | tool                   | does                                                      |
+|-------------|------------------------|-----------------------------------------------------------|
+| `workspace` | `talk_workspace_list`  | lists the room's folder (or a subfolder)                  |
+| `workspace` | `talk_workspace_read`  | reads a text file there (md, txt, csv, json, yaml, html...) |
+| `workspace` | `talk_workspace_write` | creates, replaces or appends to a text file there         |
+| `ask`       | `talk_ask_owner`       | asks an approver to let the agent do something else       |
+
+- Nothing deletes, moves, renames or shares. Overwritten text stays in the
+  file's Nextcloud versions. The share's own permissions apply: share the
+  folder without "edit" or "create" and those writes are refused.
+- **Approval** (`approval: required`): a guest's write is not done. The tool
+  posts an approval request in the room (in the thread, if any) with a
+  preview, @-mentioning the approvers. An approver's thumbs up writes exactly
+  what was previewed and posts the link; a thumbs down declines. Nobody
+  else's reaction counts, the guest's own included. `approval: off` writes at
+  once. Owner turns never wait.
+- **talk_ask_owner** is for things the guest's tools cannot do (a Deck card,
+  a file elsewhere, an email). On an approver's thumbs up the agent gets a
+  turn **as the approver**, so it has the tools that approver would have by
+  typing the request themselves (in a Hermes owner chat: the owner's). That
+  is no more than the approver could do anyway.
+- Every write and decision is logged with who asked and who approved.
+
 ## Which mode do I want?
 
 - **Bot mode** if you want a clean, no-personal-account integration that

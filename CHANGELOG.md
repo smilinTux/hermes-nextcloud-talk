@@ -4,6 +4,21 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.17.0] - 2026-11-14
+
+### Added
+
+- Room workspace (user mode): `talk_workspace_list`, `talk_workspace_read`
+  and `talk_workspace_write` (toolset `nctalk-workspace`, guest group
+  `workspace`) work on the folder(s) the agent shared into THIS room. Text
+  files only; create, replace, append; no delete, move or share.
+- Approvals: access-file `approval: required | off` and `approvers: [...]`,
+  global under `defaults:` with a per-room override (unset = required). A
+  guest's write then posts an approval request; only an approver's thumbs up
+  (writes it) or thumbs down (declines) counts.
+- `talk_ask_owner` (guest group `ask`): a guest asks an approver for
+  something its tools cannot do; the thumbs up runs it as the approver's turn.
+
 ## [1.16.0] - 2026-11-14
 
 ### Added
