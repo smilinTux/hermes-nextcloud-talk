@@ -57,6 +57,22 @@ no Hermes-level per-user allowlist layered underneath unless you opt in.
   settings; the adapter's next request fails closed (401) immediately,
   no server-side state to clean up.
 
+## Guest read tools (user mode, v1.16.0)
+
+- `talk_room_history`, `talk_room_threads` and `talk_room_files` read as the
+  agent's account, which is in many rooms. So for a non-owner they take no
+  room argument and act only on the turn's own room, which the gateway binds
+  (the model cannot set it).
+- Hermes runs them for a non-owner only through the plugin's guest guard,
+  and only with operator consent (`tools.guest`). On every call the guard
+  re-checks the platform, that the turn's room is the session's room, that
+  the access file opens this tool group (`guest_tools`) in that room, and
+  that the speaker is allowed there. Any argument that names another room
+  is refused. With no access file the call is refused.
+- What they return is what any member of the room already sees in Talk.
+  They never write, and they never read other rooms, the agent's files or
+  its memory.
+
 ## Shared across both modes
 
 - **Message length**: both connectors chunk at Nextcloud Talk's ~32000

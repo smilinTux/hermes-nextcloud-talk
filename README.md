@@ -57,6 +57,45 @@ rooms:
   abcd1234: {users: [carol], only: false}     # extra people in one room
 ```
 
+#### Guest read tools (v1.16.0)
+
+Someone allowed in only one room (like `carol` above) is a guest: Hermes runs
+their turns non-owner, with no tools beyond web search. So "where are the docs
+from the meeting?" got "I can't look that up from here". A room rule can now
+open three read tools to the people it admits, in that room only:
+
+```yaml
+rooms:
+  abcd1234: {users: [carol], only: false, guest_tools: [history, threads, files]}
+```
+
+| group     | tool                | reads                                              |
+|-----------|---------------------|----------------------------------------------------|
+| `history` | `talk_room_history` | this room's messages (main timeline or one thread) |
+| `threads` | `talk_room_threads` | this room's threads                                |
+| `files`   | `talk_room_files`   | files shared into this room                        |
+
+The tools take no room argument; the room is always the turn's own. They show
+only what any member of the room already sees in Talk. Each call goes through
+the tool's guard, which checks the access file as it is now (edits apply
+within seconds). The call is refused unless it comes from that room, from a
+person the room admits, with no argument aiming at another room. Owner turns
+can use the tools as well.
+
+This needs Hermes with plugin guest grants (`register_tool(..., guest_guard=)`)
+and the operator's consent in `config.yaml`:
+
+```yaml
+plugins:
+  entries:
+    nextcloud-talk-platform:
+      allow_guest_tools: true      # capability tools.guest
+```
+
+Without the consent, or on an older Hermes, the tools stay owner-only. The
+access file, `guest_tools` included, is meant to be edited from the
+[Agent Seats](https://github.com/smilinTux/agent-seats) app.
+
 ## Which mode do I want?
 
 - **Bot mode** if you want a clean, no-personal-account integration that

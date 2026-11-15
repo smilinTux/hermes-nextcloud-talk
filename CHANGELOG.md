@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.16.0] - 2026-11-14
+
+### Added
+
+- Guest read tools (user mode): `talk_room_history`, `talk_room_threads` and
+  `talk_room_files` (toolset `nctalk-room-read`) read THIS room only. They
+  take no room argument. A room rule in the access file opens them to the
+  people it admits: `rooms: <token>: {users: [...], guest_tools: [history,
+  threads, files]}`. Each one registers a Hermes guest guard (plugin guest
+  grants, consent `tools.guest` / `allow_guest_tools`). Without that, or on an
+  older Hermes, they stay owner-only. `NEXTCLOUD_TALK_ROOM_READ_TOOLS=off`
+  turns them off. See README "Guest read tools" and SECURITY.md.
+
 ## [1.15.1] - 2026-11-14
 
 ### Fixed
