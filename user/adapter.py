@@ -95,7 +95,7 @@ from datetime import datetime, timezone
 import json
 import mimetypes
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
 try:
@@ -211,6 +211,14 @@ LONG_POLL_TIMEOUT_ENV = "NEXTCLOUD_TALK_LONG_POLL_TIMEOUT"
 DEFAULT_LONG_POLL_TIMEOUT = 25
 ROOM_RULES_ALL_ENV = "NEXTCLOUD_TALK_ROOM_RULES_ALL_ROOMS"
 BASELINE_LOOKUP_LIMIT = 1
+# A room that appears after startup (an invitation just accepted, or someone just
+# added this account) is caught up from the previous room-list read instead of
+# skipping everything already in it: a mention posted between joining and the
+# next discovery pass was otherwise dropped (theOffice, 2026-11-17).
+JOIN_CATCHUP_LIMIT = 50
+# Slack for clock skew between this host and the Talk server (or, for a
+# federated room, the host server) when comparing message timestamps.
+JOIN_CATCHUP_GRACE_SECONDS = 10.0
 DEDUP_MAX_SIZE = 2000
 DEDUP_WINDOW_SECONDS = 600
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
@@ -930,6 +938,24 @@ def _mentions_someone_else(
     return False
 
 
+def _catchup_last_given(messages: Iterable[Dict[str, Any]], since_ts: float) -> Optional[int]:
+    """Cursor that replays only the messages posted at or after ``since_ts``.
+
+    ``messages`` is a recent history page (any order). Returns the id of the
+    newest message older than ``since_ts``; when every fetched message is newer,
+    one below the oldest fetched id (the catch-up never reaches past the page).
+    None for an empty page: the caller falls back to the normal baseline.
+    """
+    rows = [(int(m["id"]), float(m.get("timestamp") or 0)) for m in messages
+            if isinstance(m, dict) and str(m.get("id", "")).lstrip("-").isdigit()]
+    if not rows:
+        return None
+    older = [mid for mid, ts in rows if ts < since_ts]
+    if older:
+        return max(older)
+    return min(mid for mid, _ in rows) - 1
+
+
 def _invite_accept_path(invite_id) -> str:
     """OCS path that accepts a federation invitation (POST)."""
     return f"/ocs/v2.php/apps/spreed/api/v1/federation/invitation/{invite_id}"
@@ -1131,6 +1157,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._discovery_task: Optional[asyncio.Task] = None
         self._watch_flush_task: Optional[asyncio.Task] = None
         self._room_tasks: Dict[str, asyncio.Task] = {}
+        # Time of the previous successful room-list read (None until the first pass).
+        self._rooms_listed_at: Optional[float] = None
         self._room_meta: Dict[str, Dict[str, Any]] = {}
         self._seen_messages: Dict[str, float] = {}
         self._watch_buffers: Dict[str, List[MessageEvent]] = {}
@@ -1284,7 +1312,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                         or time.time() - self._caps_fetched_at > CAPS_REFRESH_SECONDS):
                     await self._refresh_capabilities()
                 await self._discover_rooms()
-                await self._discover_invitations()
+                if await self._discover_invitations():
+                    # Start polling the room just joined now, not a full interval later.
+                    await self._discover_rooms()
                 await self._refresh_profile_role()
                 backoff_idx = 0
             except asyncio.CancelledError:
@@ -1373,6 +1403,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         event.channel_prompt = f"{existing}\n\n{extra}" if existing else extra
 
     async def _discover_rooms(self) -> None:
+        listed_at = time.time()
+        since = self._rooms_listed_at
         resp = await self._http_client.get(
             "/ocs/v2.php/apps/spreed/api/v4/room", params={"format": "json"}
         )
@@ -1393,8 +1425,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                     "[%s] Discovered room %s (%s)%s -- starting poll",
                     self.name, token, room.get("displayName") or room.get("name") or token, federated,
                 )
-                self._room_tasks[token] = asyncio.create_task(self._poll_room(token))
+                # Truly new room after the first pass: catch up from the last listing.
+                catchup = since if (since is not None and token not in self._room_tasks) else None
+                self._room_tasks[token] = asyncio.create_task(
+                    self._poll_room(token, catchup_since=catchup))
 
+        self._rooms_listed_at = listed_at
         for token in list(self._room_tasks):
             if token not in live_tokens:
                 self._room_tasks.pop(token).cancel()
@@ -1446,14 +1482,16 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         cached = self._pair_rooms.get(token)
         return bool(cached and cached[0])
 
-    async def _discover_invitations(self) -> None:
+    async def _discover_invitations(self) -> int:
+        """Accept allowlisted pending invitations; returns how many were accepted."""
+        accepted = 0
         resp = await self._http_client.get(
             "/ocs/v2.php/apps/spreed/api/v1/federation/invitation",
             params={"format": "json"},
         )
         if resp.status_code == 404:
             # Federation app/endpoint not enabled yet -- not an error.
-            return
+            return 0
         resp.raise_for_status()
         invitations = resp.json().get("ocs", {}).get("data", []) or []
         for invite in invitations:
@@ -1474,6 +1512,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                         params={"format": "json"},
                     )
                     accept.raise_for_status()
+                    accepted += 1
                     logger.info(
                         "[%s] Auto-accepted federation invitation %s from %s",
                         self.name, invite_id, inviter,
@@ -1488,13 +1527,18 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                     "[%s] Federation invitation %s from %s left pending (not on allowlist)",
                     self.name, invite_id, inviter,
                 )
+        return accepted
 
     # -- Per-room long-poll -----------------------------------------------
 
-    async def _poll_room(self, token: str) -> None:
+    async def _poll_room(self, token: str, catchup_since: Optional[float] = None) -> None:
         backoff_idx = 0
         try:
-            last_given = await self._baseline_last_given(token)
+            last_given = None
+            if catchup_since is not None:
+                last_given = await self._catchup_cursor(token, catchup_since)
+            if last_given is None:
+                last_given = await self._baseline_last_given(token)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -1519,6 +1563,25 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                     await asyncio.sleep(RECONNECT_BACKOFF[backoff_idx])
                 except asyncio.CancelledError:
                     return
+
+    async def _catchup_cursor(self, token: str, since: float) -> Optional[int]:
+        """Cursor for a room joined after startup; None falls back to the baseline."""
+        try:
+            resp = await self._http_client.get(
+                f"/ocs/v2.php/apps/spreed/api/v1/chat/{token}",
+                params={"format": "json", "lookIntoFuture": 0, "limit": JOIN_CATCHUP_LIMIT,
+                        "setReadMarker": 0},
+            )
+            resp.raise_for_status()
+            messages = resp.json().get("ocs", {}).get("data", []) or []
+        except Exception as e:
+            logger.warning("[%s] Join catch-up read failed for room %s: %s", self.name, token, e)
+            return None
+        cursor = _catchup_last_given(messages, since - JOIN_CATCHUP_GRACE_SECONDS)
+        if cursor is not None:
+            logger.info("[%s] Room %s joined after startup: catching up after message %s",
+                        self.name, token, cursor)
+        return cursor
 
     async def _baseline_last_given(self, token: str) -> int:
         resp = await self._http_client.get(

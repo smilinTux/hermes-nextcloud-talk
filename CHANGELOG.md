@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.17.2] - 2026-11-17
+
+### Fixed
+
+- A message posted right after the agent joined a room (a federation
+  invitation auto-accepted, or the account added to a room) is no longer
+  dropped. A room first seen after startup now catches up from the previous
+  room-list read (up to 50 messages, 10 s clock slack) instead of skipping
+  everything already in it, and an accepted invitation triggers an immediate
+  rediscovery instead of waiting a full interval. Startup behaviour is
+  unchanged. Seen in theOffice on 2026-11-17: a mention 4 s after the accept.
+
 ## [1.17.1] - 2026-11-14
 
 ### Fixed

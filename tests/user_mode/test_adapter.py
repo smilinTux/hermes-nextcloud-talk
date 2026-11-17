@@ -1412,3 +1412,96 @@ def test_failed_participant_read_fails_closed_to_mention():
 
     assert not adapter._is_pair_room("tok1")
     assert adapter.handled_events == []
+
+
+# -- Join catch-up (room first seen after startup) ----------------------
+
+from user.adapter import JOIN_CATCHUP_GRACE_SECONDS, _catchup_last_given
+
+
+def test_catchup_cursor_replays_only_messages_since_listing():
+    msgs = [{"id": 9220, "timestamp": 1017}, {"id": 9219, "timestamp": 1013},
+            {"id": 9202, "timestamp": 900}]
+    assert _catchup_last_given(msgs, 1000) == 9202
+
+
+def test_catchup_cursor_whole_page_newer_starts_below_oldest():
+    msgs = [{"id": 12, "timestamp": 2000}, {"id": 10, "timestamp": 1999}]
+    assert _catchup_last_given(msgs, 1000) == 9
+
+
+def test_catchup_cursor_empty_page_falls_back():
+    assert _catchup_last_given([], 1000) is None
+    assert _catchup_last_given([{"foo": 1}], 1000) is None
+
+
+def _fake_resp(data=None, status=200, headers=None):
+    r = MagicMock()
+    r.status_code = status
+    r.headers = headers or {}
+    r.json.return_value = {"ocs": {"data": data if data is not None else []}}
+    r.raise_for_status = MagicMock()
+    return r
+
+
+def test_room_joined_after_startup_catches_up_instead_of_skipping():
+    """theOffice 2026-11-17: a mention 4 s after the invite was accepted was dropped."""
+    adapter = _make_adapter()
+    adapter._http_client = MagicMock()
+    adapter._refresh_pair_room = AsyncMock()
+    started = {}
+
+    async def fake_poll(token, catchup_since=None):
+        started[token] = catchup_since
+
+    adapter._poll_room = fake_poll
+    room_a = {"token": "aaa", "type": ROOM_TYPE_GROUP, "name": "A"}
+    room_b = {"token": "bbb", "type": ROOM_TYPE_GROUP, "name": "B"}
+
+    async def run():
+        adapter._http_client.get = AsyncMock(return_value=_fake_resp([room_a]))
+        await adapter._discover_rooms()
+        await asyncio.sleep(0)
+        first_listing = adapter._rooms_listed_at
+        adapter._http_client.get = AsyncMock(return_value=_fake_resp([room_a, room_b]))
+        await adapter._discover_rooms()
+        await asyncio.sleep(0)
+        return first_listing
+
+    first_listing = asyncio.run(run())
+    assert started["aaa"] is None            # startup room: normal baseline
+    assert started["bbb"] == first_listing   # new room: catch up from previous listing
+
+
+def test_catchup_cursor_reads_history_with_grace():
+    adapter = _make_adapter()
+    adapter._http_client = MagicMock()
+    msgs = [{"id": 9220, "timestamp": 1017}, {"id": 9219, "timestamp": 1013},
+            {"id": 9202, "timestamp": 900}]
+    adapter._http_client.get = AsyncMock(return_value=_fake_resp(msgs))
+    # since 1020 minus the grace still includes 9219 and 9220
+    assert JOIN_CATCHUP_GRACE_SECONDS >= 7
+    assert asyncio.run(adapter._catchup_cursor("in7f3t55", 1020)) == 9202
+
+
+def test_accepted_invite_triggers_immediate_rediscovery():
+    adapter = _make_adapter()
+    adapter._running = True
+    adapter._capabilities_checked = True
+    adapter._caps_fetched_at = 10**12
+    calls = []
+
+    async def disc():
+        calls.append("rooms")
+
+    async def inv():
+        calls.append("inv")
+        adapter._running = False
+        return 1
+
+    adapter._discover_rooms = disc
+    adapter._discover_invitations = inv
+    adapter._refresh_profile_role = AsyncMock()
+    adapter._discovery_interval = 0
+    asyncio.run(adapter._discovery_loop())
+    assert calls == ["rooms", "inv", "rooms"]
