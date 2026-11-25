@@ -4,6 +4,20 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.17.3] - 2026-11-25
+
+Security hotfix on top of 1.17.2 for live gateways (the same change is in 1.18.0).
+
+### Security
+
+- Image links in a model reply are fetched only over http(s), and the URL and every
+  redirect hop must pass Hermes' `tools.url_safety.is_safe_url`, through
+  `create_ssrf_safe_async_client`. Private, loopback, link-local and metadata addresses
+  are refused. Local paths and `file://` URLs are no longer read (core routes local
+  images to `send_image_file`). Without `tools.url_safety` nothing is fetched. Before
+  this, a prompt-injected reply could pull LAN or cloud-metadata responses, or local
+  files, into the Talk room.
+
 ## [1.17.2] - 2026-11-17
 
 ### Fixed
