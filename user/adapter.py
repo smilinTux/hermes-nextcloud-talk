@@ -1870,17 +1870,13 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._access.reload()
         return not self._access.is_agent(actor.get("id"))
 
-    def _may_configure(self, actor: Dict[str, Optional[str]], token: str, source: Any) -> bool:
-        if self._sender_allowed(actor.get("id"), token):
-            return True
-        if self._access.source == "file":
-            return False
-        # No access file: the gateway alone decides (it also honors pairing and global grants).
-        check = getattr(getattr(self, "gateway_runner", None), "_is_user_authorized_for_source", None)
-        try:
-            return bool(check(source)) if check and source is not None else False
-        except Exception:
-            return False
+    def _may_configure(self, actor: Dict[str, Optional[str]], token: str, source: Any = None) -> bool:
+        """Room settings (``/threads``) are for people the plugin's own allowlist admits:
+        the access file when there is one, else NEXTCLOUD_TALK_ALLOWED_USERS /
+        NEXTCLOUD_TALK_ALLOW_ALL_USERS. Nobody else, so with no list at all nobody may
+        (fail closed). Gateway-only grants (pairing, GATEWAY_ALLOWED_USERS) do not count:
+        asking the gateway would mean calling its private authorization method."""
+        return self._sender_allowed(actor.get("id"), token)
 
     async def _room_has_threads(self, token: str, room: Dict[str, Any]) -> bool:
         """This server lists ``threads`` and, for a federated room, so does its host."""

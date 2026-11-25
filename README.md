@@ -320,9 +320,12 @@ a new thread: the reply is the thread's first message, under a short title.
 Follow-ups in that thread are their own session, as for any thread.
 
 - `/threads on`, `/threads off`, `/threads` (status) in the room. The plugin
-  handles them itself (they never reach Hermes) and only a human allowed by the
-  room's access rules may use them; another agent cannot. In a DM that is the
-  one allowed user.
+  handles them itself (they never reach Hermes) and only a human the plugin's
+  own allowlist admits may use them: the access file when there is one, else
+  `NEXTCLOUD_TALK_ALLOWED_USERS` (or `NEXTCLOUD_TALK_ALLOW_ALL_USERS`). Another
+  agent cannot. Gateway-only grants (a pairing approval, `GATEWAY_ALLOWED_USERS`)
+  do not count, and with no list at all nobody can change the switch. In a DM
+  that is the one allowed user.
 - The title: the agent is asked to start its reply with a `Thread title:` line
   (removed from the message); if it does not, the first words of your message
   are used, with mentions, markdown and long dashes stripped.
