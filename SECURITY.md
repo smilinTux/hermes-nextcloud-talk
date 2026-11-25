@@ -57,6 +57,28 @@ no Hermes-level per-user allowlist layered underneath unless you opt in.
   settings; the adapter's next request fails closed (401) immediately,
   no server-side state to clean up.
 
+## Outbound image links (user mode, v1.18.0)
+
+- Hermes core hands the adapter every image link in a model reply, so the URL
+  is model-controlled. The adapter re-uploads it only if it is http(s) and
+  every hop, each redirect included, passes Hermes' `tools.url_safety`
+  check; the request itself goes through Hermes' SSRF-safe client, which
+  re-checks the resolved address at connect time. Private, loopback,
+  link-local (cloud metadata) and unresolvable hosts are refused.
+- If that module is missing the adapter fetches nothing and posts the link
+  as text (fail closed). Local paths and `file://` links are never read on
+  this path; Hermes routes local images to `send_image_file`.
+- Before 1.18.0 any URL was fetched with redirects and any local path was
+  read and uploaded into the room. Upgrade.
+
+## Allowlist scope (v1.18.0)
+
+- The access file is mirrored into this adapter's own config only, never
+  into the process environment, so in a multi-profile gateway one profile's
+  file cannot change another's allowlist.
+- Room settings (`/threads`) follow the plugin's own allowlist alone; with
+  none configured, nobody can change them.
+
 ## Guest read tools (user mode, v1.16.0)
 
 - `talk_room_history`, `talk_room_threads` and `talk_room_files` read as the
@@ -68,7 +90,9 @@ no Hermes-level per-user allowlist layered underneath unless you opt in.
   re-checks the platform, that the turn's room is the session's room, that
   the access file opens this tool group (`guest_tools`) in that room, and
   that the speaker is allowed there. Any argument that names another room
-  is refused. With no access file the call is refused.
+  is refused. With no access file the call is refused. On upstream Hermes,
+  which has no guest guards yet (NousResearch/hermes-agent#160124), these
+  tools are owner-only.
 - What they return is what any member of the room already sees in Talk.
   They never write, and they never read other rooms, the agent's files or
   its memory.
