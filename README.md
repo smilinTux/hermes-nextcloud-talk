@@ -566,20 +566,30 @@ another Nextcloud; the call lives on the host. `NEXTCLOUD_TALK_CALL_ROOM_MAP`
 (the agent's native nam login, from skcall's `systemd/skcall-join-nam@.service`)
 when asked from m4jyfpxq, with options in `join-og63pxfh.env`.
 
-**Always visible, even with tool_search on.** Hermes progressive disclosure
-(`tools.tool_search`) hides every plugin tool behind `tool_search` /
-`tool_describe` / `tool_call` and shows only its bare name in a long listing.
-Hidden that way, the model ignored the call tools and started skcall from the
-terminal. Hermes has no per-tool or config switch to keep a plugin tool eager
-(`tools.tool_search.defer` can only add tools to the deferred set), so the
-plugin adds `nctalk-calls` to the toolsets tool_search never defers
-(`_DIRECT_SURFACE_TOOLSETS` in `tools/tool_search.py`) when it registers. The
-three schemas cost about 560 tokens per turn in every session where the
-toolset is enabled; disable it per platform with `hermes tools` if you only
-want calls from Talk. If a future Hermes moves that internal, the plugin logs
-a warning and the tools still work, deferred. With the tools on, both
-connectors also add one line to the Talk channel prompt: use `call_join` /
-`call_leave` / `call_status` for calls, never start skcall from the terminal.
+**Tool search and these tools.** Hermes progressive disclosure
+(`tools.tool_search`) puts every plugin tool, these included, behind
+`tool_search` / `tool_describe` / `tool_call` and lists only its name. Hidden
+that way the model has been seen to ignore the call tools and start skcall
+from the terminal, and a guest turn that may not run the bridge tools cannot
+reach the room-read or workspace tools at all. The plugin no longer changes
+that itself (up to 1.17.2 it added its toolsets to a core-internal never-defer
+set; plugins may not write core module state). Your options, in
+`config.yaml`:
+
+```yaml
+tools:
+  tool_search:
+    enabled: "off"   # no deferral at all: every tool, these included, is eager
+```
+
+`tools.tool_search.defer` is a list of tool names that ADDS tools to the
+deferred set (an explicit list replaces the curated default); on current
+Hermes it cannot keep a plugin tool eager, so `enabled: "off"` is the only
+switch that does. A per-toolset "never defer" seam for plugins is proposed
+upstream in https://github.com/NousResearch/hermes-agent/issues/160125. With
+the call tools on, both connectors also add one line to the Talk channel
+prompt: use `call_join` / `call_leave` / `call_status` for calls, never start
+skcall from the terminal.
 
 ### Federation (user mode)
 
