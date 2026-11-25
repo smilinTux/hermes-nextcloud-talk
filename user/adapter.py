@@ -668,6 +668,8 @@ def _resolve_mention_placeholders(text: str, parameters: Optional[Dict[str, Any]
 
 # Hermes' document cap for chat uploads; Talk itself allows far larger shares.
 MAX_INBOUND_FILE_BYTES = 20 * 1024 * 1024
+# Redirect hops followed (each one re-checked) when fetching an image URL to re-upload.
+MAX_IMAGE_REDIRECTS = 5
 # Small text files are inlined so the model reads them without a tool call.
 MAX_INLINE_TEXT_BYTES = 100 * 1024
 _TEXT_EXTENSIONS = frozenset({
@@ -3112,24 +3114,55 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
     async def _fetch_url(self, url: str) -> Optional[bytes]:
-        """Fetch an image URL (http/https/file) for re-upload; None on any failure."""
-        if url.startswith("file://") or os.path.isabs(url):
-            path = url[7:] if url.startswith("file://") else url
-            try:
-                with open(path, "rb") as fh:
-                    return fh.read(MAX_INBOUND_FILE_BYTES + 1)[:MAX_INBOUND_FILE_BYTES]
-            except OSError:
-                return None
+        """Fetch a public http(s) image URL for re-upload; None on any failure or refusal.
+
+        Core calls ``send_image`` for every image link in a model reply, so the URL
+        is model-controlled. Every hop (the URL and each redirect target) must pass
+        Hermes' ``tools.url_safety.is_safe_url``, and the request goes through
+        ``create_ssrf_safe_async_client`` (connect-time check of the resolved IP).
+        If that module cannot be imported the fetch is refused (fail closed), never
+        done unchecked. Local paths and file:// URLs are not read here: core routes
+        local images to ``send_image_file``.
+        """
         if not url.startswith(("http://", "https://")):
             return None
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                resp = await client.get(url)
-        except Exception:
+            from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+        except Exception as e:  # old or unusual Hermes: refuse rather than fetch unchecked
+            logger.warning(
+                "[%s] Not fetching image URL: Hermes tools.url_safety unavailable (%s); "
+                "posting the link as text instead", self.name, e,
+            )
             return None
-        if resp.status_code != 200 or len(resp.content) > MAX_INBOUND_FILE_BYTES:
+        try:
+            async with create_ssrf_safe_async_client(timeout=30.0, follow_redirects=False) as client:
+                for _hop in range(MAX_IMAGE_REDIRECTS + 1):
+                    if not await asyncio.to_thread(is_safe_url, url):
+                        logger.warning("[%s] Refusing to fetch unsafe image URL %s", self.name, url[:200])
+                        return None
+                    async with client.stream("GET", url) as resp:
+                        if resp.is_redirect:
+                            location = resp.headers.get("location")
+                            if not location:
+                                return None
+                            url = str(resp.url.join(location))
+                            if not url.startswith(("http://", "https://")):
+                                return None
+                            continue
+                        if resp.status_code != 200:
+                            return None
+                        chunks: List[bytes] = []
+                        size = 0
+                        async for chunk in resp.aiter_bytes():
+                            size += len(chunk)
+                            if size > MAX_INBOUND_FILE_BYTES:
+                                return None
+                            chunks.append(chunk)
+                        return b"".join(chunks)
+        except Exception as e:
+            logger.debug("[%s] image fetch failed for %s: %s", self.name, url[:200], e)
             return None
-        return resp.content
+        return None  # too many redirects
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         # Talk's typing signal requires the signaling backend, not the
