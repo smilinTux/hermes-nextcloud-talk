@@ -16,11 +16,15 @@ Stdlib only; PyYAML is used only if importable, to read the Hermes config.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections import OrderedDict
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
+_YAML_WARNED = False
 
 LIVE_DOCS_ENV = "NEXTCLOUD_TALK_LIVE_DOCS"  # auto (default) | on | off
 RECENT_DOCS_ENV = "NEXTCLOUD_TALK_RECENT_DOCS"  # per room, default 3, 0 disables
@@ -180,8 +184,18 @@ def nc_live_configured(cfg: Optional[Mapping[str, Any]], server: str = NC_LIVE_S
 
 
 def read_hermes_config(home: str) -> Optional[Dict[str, Any]]:
+    global _YAML_WARNED
     try:
-        import yaml  # Hermes depends on PyYAML
+        import yaml  # declared in plugin.yaml python_dependencies
+    except ImportError:
+        if not _YAML_WARNED:
+            _YAML_WARNED = True
+            logger.warning(
+                "nctalk: PyYAML is not installed, so NEXTCLOUD_TALK_LIVE_DOCS=auto cannot read "
+                "config.yaml and treats nc-live as absent. Install the plugin's declared dependency "
+                "(PyYAML) or set NEXTCLOUD_TALK_LIVE_DOCS=on/off.")
+        return None
+    try:
         with open(os.path.join(home, "config.yaml"), encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except Exception:

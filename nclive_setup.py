@@ -1,5 +1,11 @@
 """``hermes nctalk nc-live-setup``: add the optional sk-nc-live MCP server to config.yaml.
 
+The entry is added with Hermes' own ``hermes mcp add nc-live --command ... --env ...``
+when that command (with ``--env``) is available and the default profile config is the
+target: Hermes then probes the server, lets you pick its tools and writes the entry
+itself. Only when it is not available (an older Hermes, or ``--config`` naming another
+file) does this module fall back to the text insertion described below.
+
 sk-nc-live (https://github.com/smilinTux/sk-nc-live) lets the agent edit
 Nextcloud Text markdown and Collabora office documents live, while people
 have them open. This command writes one ``mcp_servers.nc-live`` entry that
@@ -24,6 +30,7 @@ import argparse
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -43,8 +50,9 @@ class SetupError(Exception):
 def _yaml():
     try:
         import yaml
-    except ImportError as e:  # pragma: no cover - Hermes depends on PyYAML
-        raise SetupError("PyYAML is needed to check config.yaml") from e
+    except ImportError as e:  # declared in plugin.yaml python_dependencies
+        raise SetupError("PyYAML is needed to check config.yaml (pip install 'PyYAML>=6,<7' "
+                         "into the Hermes environment, or reinstall the plugin)") from e
     return yaml
 
 
@@ -72,15 +80,40 @@ def entry_lines(command: str = DEFAULT_COMMAND, password_env: str = DEFAULT_PASS
     ]
 
 
+def entry_env(password_env: str) -> Dict[str, str]:
+    """The server's env, as ``${VAR}`` references Hermes expands (no secret is copied)."""
+    return {
+        "NEXTCLOUD_HOST": "${NEXTCLOUD_TALK_SERVER_URL}",
+        "NEXTCLOUD_USERNAME": "${NEXTCLOUD_TALK_USERNAME}",
+        "NEXTCLOUD_PASSWORD": "${" + password_env + "}",
+    }
+
+
+def mcp_add_argv(hermes: str, command: str, password_env: str) -> List[str]:
+    """``hermes mcp add nc-live --command CMD --env K=V ...`` (``--env`` takes the rest)."""
+    entry_lines(command, password_env)  # same validation as the text path
+    return [hermes, "mcp", "add", SERVER_NAME, "--command", command, "--env",
+            *(f"{k}={v}" for k, v in entry_env(password_env).items())]
+
+
+def find_hermes_mcp_add(which: Callable[[str], Optional[str]] = shutil.which,
+                        runner: Callable[..., Any] = subprocess.run) -> Optional[str]:
+    """Path of a ``hermes`` whose ``mcp add`` takes ``--env``, else None."""
+    hermes = which("hermes")
+    if not hermes:
+        return None
+    try:
+        res = runner([hermes, "mcp", "add", "--help"], capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    return hermes if getattr(res, "returncode", 1) == 0 and "--env" in (res.stdout or "") else None
+
+
 def expected_entry(command: str, password_env: str) -> Dict[str, Any]:
     return {
         "command": command,
         "args": [],
-        "env": {
-            "NEXTCLOUD_HOST": "${NEXTCLOUD_TALK_SERVER_URL}",
-            "NEXTCLOUD_USERNAME": "${NEXTCLOUD_TALK_USERNAME}",
-            "NEXTCLOUD_PASSWORD": "${" + password_env + "}",
-        },
+        "env": entry_env(password_env),
         "enabled": True,
     }
 
@@ -173,9 +206,46 @@ def default_config_path() -> str:
     return os.path.join(threadsmode.hermes_home(), "config.yaml")
 
 
+def run_with_hermes(hermes: str, config_path: str, *, command: str = DEFAULT_COMMAND,
+                    password_env: str = DEFAULT_PASSWORD_ENV, dry_run: bool = False, out=None,
+                    runner: Callable[..., Any] = subprocess.call) -> int:
+    """Add the entry through ``hermes mcp add``; it asks its own questions."""
+    out = out or sys.stdout
+
+    def say(msg: str = "") -> None:
+        print(msg, file=out)
+
+    try:
+        argv = mcp_add_argv(hermes, command, password_env)
+    except SetupError as e:
+        say(f"nc-live setup: {e}")
+        return 2
+    text = ""
+    if os.path.exists(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            text = f.read()
+    try:
+        current = (_yaml().safe_load(text) if text.strip() else None) or {}
+    except Exception as e:
+        say(f"nc-live setup: config.yaml does not parse, not touching it: {e}")
+        return 1
+    if isinstance(current, dict) and SERVER_NAME in (current.get("mcp_servers") or {}):
+        say(f"nc-live setup: mcp_servers.{SERVER_NAME} already exists in {config_path}; left as it is.")
+        return 0
+    say("nc-live setup: running: hermes " + " ".join(argv[1:7] + [f"'{a}'" for a in argv[7:]]))
+    if dry_run:
+        say("Dry run: nothing run.")
+        return 0
+    rc = runner(argv)
+    if rc == 0:
+        say(f"Install sk-nc-live so that {command!r} is on the gateway's PATH, then restart the gateway.")
+    return rc
+
+
 def run(config_path: str, *, command: str = DEFAULT_COMMAND, password_env: str = DEFAULT_PASSWORD_ENV,
         assume_yes: bool = False, dry_run: bool = False,
         ask: Callable[[str], str] = input, out=None) -> int:
+    """Fallback: insert the block into config.yaml as text (keeps comments, writes a backup)."""
     out = out or sys.stdout
 
     def say(msg: str = "") -> None:
@@ -246,6 +316,12 @@ def _handle(args: argparse.Namespace) -> int:
         print("usage: hermes nctalk nc-live-setup [--dry-run] [--yes] [--command CMD] "
               "[--password-env NAME] [--config PATH]")
         return 2
+    hermes = None if args.config else find_hermes_mcp_add()
+    if hermes:
+        return run_with_hermes(hermes, default_config_path(), command=args.command,
+                               password_env=args.password_env, dry_run=args.dry_run)
+    if not args.config:
+        print("nc-live setup: this Hermes has no 'hermes mcp add --env'; editing config.yaml directly.")
     return run(args.config or default_config_path(), command=args.command,
                password_env=args.password_env, assume_yes=args.yes, dry_run=args.dry_run)
 

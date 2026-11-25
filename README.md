@@ -57,6 +57,13 @@ rooms:
   abcd1234: {users: [carol], only: false}     # extra people in one room
 ```
 
+The plugin hands the gateway the same list through its own adapter config
+(`extra.allowed_users`), never through the process environment, which a
+multi-profile gateway shares. The gateway reads an env allowlist first, so
+with an access file leave `NEXTCLOUD_TALK_ALLOWED_USERS` and
+`NEXTCLOUD_TALK_ALLOW_ALL_USERS` unset; the plugin logs a warning when one is
+set and would refuse or admit someone the file does not.
+
 #### Guest read tools (v1.16.0)
 
 Someone allowed in only one room (like `carol` above) is a guest: Hermes runs
@@ -134,6 +141,25 @@ rooms:
   typing the request themselves (in a Hermes owner chat: the owner's). That
   is no more than the approver could do anyway.
 - Every write and decision is logged with who asked and who approved.
+
+#### On upstream Hermes: guest grants are inert
+
+The guest features above rely on two seams that exist only in the sk Hermes
+fork today: per-tool guest guards (`register_tool(..., guest_guard=)`, consent
+capability `tools.guest`) and the per-turn owner check
+(`tools.session_scope`). Both are proposed upstream in
+https://github.com/NousResearch/hermes-agent/issues/160124. On upstream
+Hermes the plugin loads and every tool registers, but it fails closed:
+
+- Guest grants do nothing. `guest_tools` in the access file is ignored, and
+  the room-read, workspace and `talk_ask_owner` tools are owner-only.
+- The plugin cannot tell an owner turn from a guest one, so it treats every
+  turn as a guest's: with `approval: required` (the default) even the
+  owner's own `talk_workspace_write` posts an approval request and waits
+  for an approver's thumbs up. Set `approvers:` in the access file, or use
+  `approval: off` in rooms where that is acceptable.
+
+Nothing is opened up by an older or different core; it can only do less.
 
 ## Which mode do I want?
 
@@ -320,9 +346,12 @@ a new thread: the reply is the thread's first message, under a short title.
 Follow-ups in that thread are their own session, as for any thread.
 
 - `/threads on`, `/threads off`, `/threads` (status) in the room. The plugin
-  handles them itself (they never reach Hermes) and only a human allowed by the
-  room's access rules may use them; another agent cannot. In a DM that is the
-  one allowed user.
+  handles them itself (they never reach Hermes) and only a human the plugin's
+  own allowlist admits may use them: the access file when there is one, else
+  `NEXTCLOUD_TALK_ALLOWED_USERS` (or `NEXTCLOUD_TALK_ALLOW_ALL_USERS`). Another
+  agent cannot. Gateway-only grants (a pairing approval, `GATEWAY_ALLOWED_USERS`)
+  do not count, and with no list at all nobody can change the switch. In a DM
+  that is the one allowed user.
 - The title: the agent is asked to start its reply with a `Thread title:` line
   (removed from the message); if it does not, the first words of your message
   are used, with mentions, markdown and long dashes stripped.
@@ -444,6 +473,13 @@ are attached. Only messages the agent answers trigger a download; files in a
 room it is just listening to show up as `[file: name (type)]` in its context.
 The cap is 20 MB per file.
 
+An image link in a reply is fetched and re-uploaded only when it is a public
+http(s) URL: every hop, redirects included, must pass Hermes'
+`tools.url_safety` check (no private, loopback or link-local hosts), and a
+Hermes without that module never fetches (the link is posted as text).
+Local paths are never read for an image link; files the agent produces go
+through Hermes' own file sending.
+
 The agent can send files too. They are uploaded to `Talk/<unique folder>/` in
 the agent account's own Files and shared into the room, so give the account
 some storage quota. Voice replies arrive as Talk voice messages.
@@ -483,12 +519,24 @@ Install sk-nc-live (see its README) so `sk-nc-live-mcp` is on the gateway's
 `PATH`, then add it to Hermes:
 
 ```
-hermes nctalk nc-live-setup --dry-run   # show the block
-hermes nctalk nc-live-setup             # show it, ask, then write it
+hermes nctalk nc-live-setup --dry-run   # show what it would do
+hermes nctalk nc-live-setup             # do it
 ```
 
-It adds this to the profile's `config.yaml` and never changes an existing
-`nc-live` entry:
+When this Hermes has `hermes mcp add ... --env`, the command runs
+
+```
+hermes mcp add nc-live --command sk-nc-live-mcp --env \
+  'NEXTCLOUD_HOST=${NEXTCLOUD_TALK_SERVER_URL}' \
+  'NEXTCLOUD_USERNAME=${NEXTCLOUD_TALK_USERNAME}' \
+  'NEXTCLOUD_PASSWORD=${NEXTCLOUD_TALK_APP_PASSWORD}'
+```
+
+so Hermes probes the server, lets you pick its tools and writes the entry
+itself (you can also run that line by hand). On an older Hermes, or with
+`--config PATH`, it inserts the block into `config.yaml` as text instead
+(asks first, `--yes` skips the question, keeps comments, writes a backup).
+Either way it never changes an existing `nc-live` entry. The result:
 
 ```yaml
 mcp_servers:
@@ -566,20 +614,30 @@ another Nextcloud; the call lives on the host. `NEXTCLOUD_TALK_CALL_ROOM_MAP`
 (the agent's native nam login, from skcall's `systemd/skcall-join-nam@.service`)
 when asked from m4jyfpxq, with options in `join-og63pxfh.env`.
 
-**Always visible, even with tool_search on.** Hermes progressive disclosure
-(`tools.tool_search`) hides every plugin tool behind `tool_search` /
-`tool_describe` / `tool_call` and shows only its bare name in a long listing.
-Hidden that way, the model ignored the call tools and started skcall from the
-terminal. Hermes has no per-tool or config switch to keep a plugin tool eager
-(`tools.tool_search.defer` can only add tools to the deferred set), so the
-plugin adds `nctalk-calls` to the toolsets tool_search never defers
-(`_DIRECT_SURFACE_TOOLSETS` in `tools/tool_search.py`) when it registers. The
-three schemas cost about 560 tokens per turn in every session where the
-toolset is enabled; disable it per platform with `hermes tools` if you only
-want calls from Talk. If a future Hermes moves that internal, the plugin logs
-a warning and the tools still work, deferred. With the tools on, both
-connectors also add one line to the Talk channel prompt: use `call_join` /
-`call_leave` / `call_status` for calls, never start skcall from the terminal.
+**Tool search and these tools.** Hermes progressive disclosure
+(`tools.tool_search`) puts every plugin tool, these included, behind
+`tool_search` / `tool_describe` / `tool_call` and lists only its name. Hidden
+that way the model has been seen to ignore the call tools and start skcall
+from the terminal, and a guest turn that may not run the bridge tools cannot
+reach the room-read or workspace tools at all. The plugin no longer changes
+that itself (up to 1.17.2 it added its toolsets to a core-internal never-defer
+set; plugins may not write core module state). Your options, in
+`config.yaml`:
+
+```yaml
+tools:
+  tool_search:
+    enabled: "off"   # no deferral at all: every tool, these included, is eager
+```
+
+`tools.tool_search.defer` is a list of tool names that ADDS tools to the
+deferred set (an explicit list replaces the curated default); on current
+Hermes it cannot keep a plugin tool eager, so `enabled: "off"` is the only
+switch that does. A per-toolset "never defer" seam for plugins is proposed
+upstream in https://github.com/NousResearch/hermes-agent/issues/160125. With
+the call tools on, both connectors also add one line to the Talk channel
+prompt: use `call_join` / `call_leave` / `call_status` for calls, never start
+skcall from the terminal.
 
 ### Federation (user mode)
 

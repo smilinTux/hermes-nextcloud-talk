@@ -35,10 +35,9 @@ def _access_file(tmp_path, body):
 
 
 def _adapter(tmp_path, monkeypatch, body=None, **extra):
-    # The adapter writes the gateway's env list when a file is present; let
-    # monkeypatch restore it after the test.
-    monkeypatch.setenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
-    monkeypatch.setenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
+    # Keep a test's own env setting, else start empty; monkeypatch restores it after.
+    for key in ("NEXTCLOUD_TALK_ALLOWED_USERS", "NEXTCLOUD_TALK_ALLOW_ALL_USERS"):
+        monkeypatch.setenv(key, os.environ.get(key, ""))
     if body is not None:
         monkeypatch.setenv(access.ACCESS_FILE_ENV, str(_access_file(tmp_path, body)))
     extra.setdefault("poll_settle_seconds", "0")
@@ -78,12 +77,25 @@ def test_room_rules_add_or_replace(tmp_path, monkeypatch):
     assert a._sender_allowed("jarvis@skhub.nativeassetmanagement.com", "only1")  # agents always listed
 
 
-def test_gateway_list_follows_the_file(tmp_path, monkeypatch):
+def test_gateway_list_follows_the_file_without_touching_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
+    monkeypatch.setenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
     a = _adapter(tmp_path, monkeypatch, FILE)
-    ids = os.environ["NEXTCLOUD_TALK_ALLOWED_USERS"].split(",")
+    ids = a.config.extra["allowed_users"].split(",")
     assert {"chef", FED_CASEY, "jarvis@skhub.nativeassetmanagement.com", "guest1", "solo"} <= set(ids)
-    assert os.environ["NEXTCLOUD_TALK_ALLOW_ALL_USERS"] == "false"
-    assert a.config.extra["allowed_users"] == os.environ["NEXTCLOUD_TALK_ALLOWED_USERS"]
+    assert a.config.extra["allow_all_users"] is False
+    # Multi-profile gateway: the process environment is shared, so it is never written.
+    assert os.environ["NEXTCLOUD_TALK_ALLOWED_USERS"] == ""
+    assert os.environ["NEXTCLOUD_TALK_ALLOW_ALL_USERS"] == ""
+
+
+def test_env_list_shadowing_the_file_is_warned(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("NEXTCLOUD_TALK_ALLOWED_USERS", "chef")
+    with caplog.at_level("WARNING"):
+        _adapter(tmp_path, monkeypatch, FILE)
+    assert any("NEXTCLOUD_TALK_ALLOWED_USERS is also set" in r.getMessage() and "guest1" in r.getMessage()
+               for r in caplog.records)
+    assert os.environ["NEXTCLOUD_TALK_ALLOWED_USERS"] == "chef"
 
 
 def test_file_reload_on_change(tmp_path, monkeypatch):
@@ -94,7 +106,7 @@ def test_file_reload_on_change(tmp_path, monkeypatch):
     p.write_text("users: [chef, caseyK]\n")
     os.utime(p, (time.time() + 5, time.time() + 5))
     assert a._sender_allowed("caseyk")
-    assert "caseyK" in os.environ["NEXTCLOUD_TALK_ALLOWED_USERS"].split(",")
+    assert "caseyK" in a.config.extra["allowed_users"].split(",")
 
 
 def test_broken_file_keeps_last_good(tmp_path, monkeypatch):

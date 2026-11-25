@@ -192,3 +192,65 @@ def test_register_cli_uses_hermes_hook_when_present():
     ns.register_cli(Ctx())
     assert calls and calls[0]["name"] == "nctalk"
     ns.register_cli(object())  # older Hermes without the hook: no error
+
+
+# ---- 1.18.0: through Hermes' own `hermes mcp add` when it has --env ------------------------------
+class _Res:
+    def __init__(self, rc, out):
+        self.returncode, self.stdout = rc, out
+
+
+def test_mcp_add_argv_uses_env_references_not_values(monkeypatch):
+    sentinel = "env-" + "value-sentinel"  # a set value must never be copied into argv
+    monkeypatch.setenv("NEXTCLOUD_TALK_APP_PASSWORD", sentinel)
+    argv = ns.mcp_add_argv("/bin/hermes", "sk-nc-live-mcp", "NEXTCLOUD_TALK_APP_PASSWORD")
+    assert argv[:6] == ["/bin/hermes", "mcp", "add", "nc-live", "--command", "sk-nc-live-mcp"]
+    assert argv[6] == "--env" and set(argv[7:]) == {
+        "NEXTCLOUD_HOST=${NEXTCLOUD_TALK_SERVER_URL}", "NEXTCLOUD_USERNAME=${NEXTCLOUD_TALK_USERNAME}",
+        "NEXTCLOUD_PASSWORD=${NEXTCLOUD_TALK_APP_PASSWORD}"}
+    assert sentinel not in " ".join(argv)
+
+
+def test_mcp_add_argv_rejects_a_pasted_secret_as_env_name():
+    with pytest.raises(ns.SetupError):
+        ns.mcp_add_argv("/bin/hermes", "sk-nc-live-mcp", "not a name!")
+
+
+def test_find_hermes_mcp_add_needs_the_env_flag():
+    which = lambda _n: "/bin/hermes"  # noqa: E731
+    assert ns.find_hermes_mcp_add(which, lambda *a, **k: _Res(0, "usage ... --env [ENV ...]")) == "/bin/hermes"
+    assert ns.find_hermes_mcp_add(which, lambda *a, **k: _Res(0, "usage ... --url URL")) is None
+    assert ns.find_hermes_mcp_add(which, lambda *a, **k: _Res(2, "")) is None
+    assert ns.find_hermes_mcp_add(lambda _n: None) is None
+
+
+def test_run_with_hermes_delegates_and_skips_an_existing_entry(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(EXISTING)
+    calls, out = [], io.StringIO()
+    assert ns.run_with_hermes("/bin/hermes", str(cfg), out=out, runner=lambda a: calls.append(a) or 0) == 0
+    assert calls and calls[0][1:4] == ["mcp", "add", "nc-live"]
+    assert cfg.read_text() == EXISTING  # the plugin itself never edits the text on this path
+
+    cfg.write_text(EXISTING.replace("  nextcloud:", "  nc-live:\n    command: x\n  nextcloud:"))
+    calls.clear()
+    assert ns.run_with_hermes("/bin/hermes", str(cfg), out=io.StringIO(), runner=calls.append) == 0
+    assert calls == []
+
+
+def test_run_with_hermes_dry_run_runs_nothing(tmp_path):
+    calls, out = [], io.StringIO()
+    assert ns.run_with_hermes("/bin/hermes", str(tmp_path / "none.yaml"), dry_run=True, out=out,
+                              runner=calls.append) == 0
+    assert calls == [] and "hermes mcp add nc-live --command" in out.getvalue()
+
+
+def test_handler_prefers_hermes_mcp_add_for_the_default_profile(monkeypatch, tmp_path):
+    parser = argparse.ArgumentParser()
+    ns._setup_parser(parser)
+    seen = []
+    monkeypatch.setattr(ns, "find_hermes_mcp_add", lambda: "/bin/hermes")
+    monkeypatch.setattr(ns, "default_config_path", lambda: str(tmp_path / "config.yaml"))
+    monkeypatch.setattr(ns, "run_with_hermes", lambda h, p, **kw: seen.append((h, p)) or 0)
+    assert ns._handle(parser.parse_args(["nc-live-setup"])) == 0
+    assert seen == [("/bin/hermes", str(tmp_path / "config.yaml"))]

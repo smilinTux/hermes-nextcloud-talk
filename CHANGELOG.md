@@ -4,6 +4,61 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.18.0] - 2026-11-25
+
+Fixes for the Hermes plugin catalog review (NousResearch/hermes-agent#158275).
+
+### Security
+
+- **Image links are SSRF-checked and local files are never read** (review
+  item 1). `send_image` fetched any http(s) URL with redirects and no
+  private-host check, and read any absolute path or `file://` URL, then
+  uploaded the bytes into the room. Every hop (the URL and each redirect,
+  at most 5) must now pass `tools.url_safety.is_safe_url`, the fetch goes
+  through `create_ssrf_safe_async_client`, the body is capped at 20 MB while
+  streaming, and a Hermes without `tools.url_safety` refuses the fetch (fail
+  closed: the link is posted as text). The local-path branch is gone; core
+  routes local images to `send_image_file`.
+- **The allowlist is never written into `os.environ`** (review item 4). With
+  an access file, the plugin wrote `NEXTCLOUD_TALK_ALLOWED_USERS` and
+  `NEXTCLOUD_TALK_ALLOW_ALL_USERS` into the shared process environment, so in
+  a multi-profile gateway one profile changed another's allowlist. Only this
+  adapter's `config.extra` is updated now. A warning names access-file users
+  that an env list set alongside the file would shadow in the gateway check.
+
+### Changed
+
+- **No more writes to core `tools.tool_search` state** (review item 2).
+  `pin_visible()`, which added the plugin's toolsets to
+  `_DIRECT_SURFACE_TOOLSETS`, is removed. The plugin's tools are deferred
+  behind `tool_search` like any plugin tool unless the operator sets
+  `tools.tool_search.enabled: "off"` (README "Tool search and these tools").
+  A per-toolset never-defer seam is proposed upstream in
+  https://github.com/NousResearch/hermes-agent/issues/160125.
+- **Room-configure rights come from the plugin's own allowlist** (review
+  item 3). `/threads` no longer asks the gateway's private
+  `_is_user_authorized_for_source`. The access file decides when present,
+  else `NEXTCLOUD_TALK_ALLOWED_USERS` / `NEXTCLOUD_TALK_ALLOW_ALL_USERS`;
+  with neither, nobody may toggle (fail closed). A user admitted only by a
+  pairing approval or `GATEWAY_ALLOWED_USERS` can no longer toggle.
+- **Guest seams documented as sk-fork-only; registration cannot crash**
+  (review item 5). `tools.session_scope`, `register_tool(guest_guard=)` and
+  the `tools.guest` capability are kept and stay fail-closed. A core that
+  rejects the `guest_guard` keyword now gets the tool registered without it
+  (owner-only). README "On upstream Hermes: guest grants are inert": guest
+  grants do nothing there and owner workspace writes also wait for approval.
+  The seam is proposed upstream in
+  https://github.com/NousResearch/hermes-agent/issues/160124.
+- **PyYAML is declared** (review item 6): `python_dependencies:
+  ["PyYAML>=6.0,<7"]` in `plugin.yaml`. Without it the access file falls back
+  to the subset parser with a warning, `NEXTCLOUD_TALK_LIVE_DOCS=auto` warns
+  and treats nc-live as absent, and `nc-live-setup` says how to install it.
+- **`nc-live-setup` uses `hermes mcp add`** (review, recommended). When this
+  Hermes has `hermes mcp add ... --env`, the command runs `hermes mcp add
+  nc-live --command sk-nc-live-mcp --env ...` (Hermes probes the server and
+  writes the entry). The config.yaml text insertion remains the fallback for
+  an older Hermes or `--config PATH`.
+
 ## [1.17.2] - 2026-11-17
 
 ### Fixed

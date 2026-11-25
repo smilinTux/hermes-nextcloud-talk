@@ -668,6 +668,8 @@ def _resolve_mention_placeholders(text: str, parameters: Optional[Dict[str, Any]
 
 # Hermes' document cap for chat uploads; Talk itself allows far larger shares.
 MAX_INBOUND_FILE_BYTES = 20 * 1024 * 1024
+# Redirect hops followed (each one re-checked) when fetching an image URL to re-upload.
+MAX_IMAGE_REDIRECTS = 5
 # Small text files are inlined so the model reads them without a tool call.
 MAX_INLINE_TEXT_BYTES = 100 * 1024
 _TEXT_EXTENSIONS = frozenset({
@@ -1868,17 +1870,13 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._access.reload()
         return not self._access.is_agent(actor.get("id"))
 
-    def _may_configure(self, actor: Dict[str, Optional[str]], token: str, source: Any) -> bool:
-        if self._sender_allowed(actor.get("id"), token):
-            return True
-        if self._access.source == "file":
-            return False
-        # No access file: the gateway alone decides (it also honors pairing and global grants).
-        check = getattr(getattr(self, "gateway_runner", None), "_is_user_authorized_for_source", None)
-        try:
-            return bool(check(source)) if check and source is not None else False
-        except Exception:
-            return False
+    def _may_configure(self, actor: Dict[str, Optional[str]], token: str, source: Any = None) -> bool:
+        """Room settings (``/threads``) are for people the plugin's own allowlist admits:
+        the access file when there is one, else NEXTCLOUD_TALK_ALLOWED_USERS /
+        NEXTCLOUD_TALK_ALLOW_ALL_USERS. Nobody else, so with no list at all nobody may
+        (fail closed). Gateway-only grants (pairing, GATEWAY_ALLOWED_USERS) do not count:
+        asking the gateway would mean calling its private authorization method."""
+        return self._sender_allowed(actor.get("id"), token)
 
     async def _room_has_threads(self, token: str, room: Dict[str, Any]) -> bool:
         """This server lists ``threads`` and, for a federated room, so does its host."""
@@ -2812,21 +2810,43 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         return self._access.allowed(user_id, room)
 
     def _sync_gateway_allowlist(self) -> None:
-        """With an access file, hand the gateway the same list.
+        """With an access file, hand the gateway the same list, through THIS adapter only.
 
-        The adapter gates at intake; the gateway's own check is the second
-        line. It reads ``NEXTCLOUD_TALK_ALLOWED_USERS`` live (or, with no env
-        list, this adapter's ``extra.allowed_users``), so both are updated.
+        The adapter gates at intake; the gateway's own check is the second line. With
+        no ``NEXTCLOUD_TALK_ALLOWED_USERS`` in the environment it reads the live
+        adapter's ``extra.allowed_users``, which is updated here. The process
+        environment is never written: in a multi-profile gateway it is shared, and a
+        write would change another profile's allowlist.
         """
         if self._access.source != "file":
             return
         ids = ",".join(self._access.gateway_ids())
-        os.environ["NEXTCLOUD_TALK_ALLOWED_USERS"] = ids
-        os.environ["NEXTCLOUD_TALK_ALLOW_ALL_USERS"] = "false"
         extra = getattr(self.config, "extra", None)
         if isinstance(extra, dict):
             extra["allowed_users"] = ids
             extra["allow_all_users"] = False
+        self._warn_env_shadows_file(ids)
+
+    def _warn_env_shadows_file(self, ids: str) -> None:
+        """An env allowlist takes precedence in the gateway's check, so with one set
+        the access file's later additions would be refused there. Say so, once per change."""
+        env_users = _parse_allowlist(os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", ""))
+        env_all = _truthy(os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", ""))
+        missing = sorted(set(_parse_allowlist(ids)) - env_users) if env_users else []
+        key = (tuple(missing), env_all)
+        if key == getattr(self, "_env_shadow_warned", None):
+            return
+        self._env_shadow_warned = key
+        if missing:
+            logger.warning(
+                "[%s] Access file in use but NEXTCLOUD_TALK_ALLOWED_USERS is also set; the gateway "
+                "reads the env list first, so these access-file users will be refused there: %s. "
+                "Unset NEXTCLOUD_TALK_ALLOWED_USERS when using an access file.",
+                self.name, ", ".join(missing))
+        if env_all:
+            logger.warning(
+                "[%s] Access file in use but NEXTCLOUD_TALK_ALLOW_ALL_USERS is set; the plugin still "
+                "gates on the file, but unset it so the gateway does not admit everyone.", self.name)
 
     async def _dispatch_watch_digest(self, token: str, events: List[MessageEvent]) -> None:
         """Send one watch-mode digest as an ordinary inbound event.
@@ -3112,24 +3132,55 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
     async def _fetch_url(self, url: str) -> Optional[bytes]:
-        """Fetch an image URL (http/https/file) for re-upload; None on any failure."""
-        if url.startswith("file://") or os.path.isabs(url):
-            path = url[7:] if url.startswith("file://") else url
-            try:
-                with open(path, "rb") as fh:
-                    return fh.read(MAX_INBOUND_FILE_BYTES + 1)[:MAX_INBOUND_FILE_BYTES]
-            except OSError:
-                return None
+        """Fetch a public http(s) image URL for re-upload; None on any failure or refusal.
+
+        Core calls ``send_image`` for every image link in a model reply, so the URL
+        is model-controlled. Every hop (the URL and each redirect target) must pass
+        Hermes' ``tools.url_safety.is_safe_url``, and the request goes through
+        ``create_ssrf_safe_async_client`` (connect-time check of the resolved IP).
+        If that module cannot be imported the fetch is refused (fail closed), never
+        done unchecked. Local paths and file:// URLs are not read here: core routes
+        local images to ``send_image_file``.
+        """
         if not url.startswith(("http://", "https://")):
             return None
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                resp = await client.get(url)
-        except Exception:
+            from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+        except Exception as e:  # old or unusual Hermes: refuse rather than fetch unchecked
+            logger.warning(
+                "[%s] Not fetching image URL: Hermes tools.url_safety unavailable (%s); "
+                "posting the link as text instead", self.name, e,
+            )
             return None
-        if resp.status_code != 200 or len(resp.content) > MAX_INBOUND_FILE_BYTES:
+        try:
+            async with create_ssrf_safe_async_client(timeout=30.0, follow_redirects=False) as client:
+                for _hop in range(MAX_IMAGE_REDIRECTS + 1):
+                    if not await asyncio.to_thread(is_safe_url, url):
+                        logger.warning("[%s] Refusing to fetch unsafe image URL %s", self.name, url[:200])
+                        return None
+                    async with client.stream("GET", url) as resp:
+                        if resp.is_redirect:
+                            location = resp.headers.get("location")
+                            if not location:
+                                return None
+                            url = str(resp.url.join(location))
+                            if not url.startswith(("http://", "https://")):
+                                return None
+                            continue
+                        if resp.status_code != 200:
+                            return None
+                        chunks: List[bytes] = []
+                        size = 0
+                        async for chunk in resp.aiter_bytes():
+                            size += len(chunk)
+                            if size > MAX_INBOUND_FILE_BYTES:
+                                return None
+                            chunks.append(chunk)
+                        return b"".join(chunks)
+        except Exception as e:
+            logger.debug("[%s] image fetch failed for %s: %s", self.name, url[:200], e)
             return None
-        return resp.content
+        return None  # too many redirects
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         # Talk's typing signal requires the signaling backend, not the

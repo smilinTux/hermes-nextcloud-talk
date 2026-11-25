@@ -251,16 +251,33 @@ def test_bot_actor_cannot_toggle(tmp_path, monkeypatch):
     assert not a._threads_mode_stored("dm1")
 
 
-def test_gateway_authorised_user_may_toggle_without_access_file(tmp_path, monkeypatch):
+def test_env_allowlisted_user_may_toggle_without_access_file(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch, allowed_users="chef"), Talk()
+    _wire(a, talk)
+    _run(a._on_message("dm1", _msg(1, "chef", "/threads on")))
+    assert a._threads_mode_stored("dm1") is True
+
+
+def test_gateway_only_grant_does_not_configure_rooms(tmp_path, monkeypatch):
+    """Only the plugin's own allowlist decides; the gateway's private auth is never asked."""
     a, talk = _adapter(tmp_path, monkeypatch, allowed_users="nobody"), Talk()
 
     class Runner:
         def _is_user_authorized_for_source(self, source):
-            return source.user_id == "paired"
+            raise AssertionError("private gateway method called")
     a.gateway_runner = Runner()
     _wire(a, talk)
     _run(a._on_message("dm1", _msg(1, "paired", "/threads on")))
-    assert a._threads_mode_stored("dm1") is True
+    assert not a._threads_mode_stored("dm1")
+
+
+def test_no_allowlist_at_all_configures_nothing(tmp_path, monkeypatch):
+    monkeypatch.delenv("NEXTCLOUD_TALK_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", raising=False)
+    a, talk = _adapter(tmp_path, monkeypatch, allowed_users=""), Talk()
+    _wire(a, talk)
+    _run(a._on_message("dm1", _msg(1, "chef", "/threads on")))
+    assert not a._threads_mode_stored("dm1")
 
 
 def test_busy_ack_does_not_become_the_root_and_title_never_leaks(tmp_path, monkeypatch):

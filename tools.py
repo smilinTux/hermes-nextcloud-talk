@@ -397,45 +397,6 @@ TOOLS = (
 )
 
 
-_TOOL_SEARCH_MODULE = "tools.tool_search"
-_DIRECT_ATTR = "_DIRECT_SURFACE_TOOLSETS"
-
-
-def pin_visible() -> bool:
-    """Keep the ``nctalk-calls`` toolset out of Hermes tool_search deferral.
-
-    Hermes progressive disclosure (``tools/tool_search.py``) defers EVERY plugin
-    tool behind ``tool_search`` / ``tool_describe`` / ``tool_call`` unless its
-    toolset is in ``_DIRECT_SURFACE_TOOLSETS``; ``register_tool`` has no
-    per-tool flag and ``tools.tool_search.defer`` in config.yaml can only ADD
-    tools to the deferred set, never pin one eager. Deferred, the call tools
-    only appear as bare names in a 240-tool listing, and the model reaches for
-    ``terminal`` instead (seen live: "@lumina join call" -> a hand-built venv
-    and ``systemd-run ... skcall join``). Three schemas cost ~560 tokens.
-
-    ``is_deferrable_tool_name`` reads the module global on every call, so
-    rebinding it (frozenset, idempotent) is enough. Best effort: if the Hermes
-    internals ever move, the tools still work, just deferred again.
-    """
-    try:
-        import importlib
-        ts = importlib.import_module(_TOOL_SEARCH_MODULE)
-        current = getattr(ts, _DIRECT_ATTR)
-        # The guest toolsets must be direct too: a non-owner turn may not run
-        # tool_search / tool_call, so a deferred guest tool is unreachable there.
-        wanted = {TOOLSET, THREAD_TOOLSET, POLL_TOOLSET, CAPS_TOOLSET,
-                  ROOM_READ_TOOLSET, WORKSPACE_TOOLSET}
-        if not wanted <= set(current):
-            setattr(ts, _DIRECT_ATTR, frozenset(current) | wanted)
-        return True
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning(
-            "nctalk: could not pin %s visible; call tools stay behind tool_search", TOOLSET,
-            exc_info=True)
-        return False
-
-
 # ----------------------------------------------------------------- threads
 _THREAD_ROOM_HINT = (" From a Talk chat, leave room EMPTY: it means this chat. Never fill room "
                      "from a home channel, a channel list or memory.")
@@ -1963,6 +1924,26 @@ def _supports_guest_guard(ctx) -> bool:
         return False
 
 
+def _register_guest_tool(ctx, kw: dict, guard) -> bool:
+    """Register one guest-capable tool; returns whether guest guards still look supported.
+
+    ``guest_guard`` is a seam of the sk Hermes fork (proposed upstream in
+    NousResearch/hermes-agent#160124). A core that refuses the keyword gets the tool
+    without it: it then stays owner-only (fail closed), and registration never crashes."""
+    if guard is not None:
+        try:
+            ctx.register_tool(**kw, guest_guard=guard)
+            return True
+        except TypeError as e:
+            if "guest_guard" not in str(e):
+                raise
+            import logging
+            logging.getLogger(__name__).info(
+                "nctalk: this Hermes has no register_tool(guest_guard=); guest tools stay owner-only")
+    ctx.register_tool(**kw)
+    return False
+
+
 def register_tools(ctx) -> None:
     """Register the call tools (``nctalk-calls``, gated on NEXTCLOUD_TALK_CALL_TOOLS) and the
     thread tools (``nctalk-threads``, on in user mode unless NEXTCLOUD_TALK_THREAD_TOOLS=off)."""
@@ -1979,15 +1960,8 @@ def register_tools(ctx) -> None:
         ctx.register_tool(name=name, toolset=CAPS_TOOLSET, schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji, check_fn=server_tools_enabled)
     guests = _supports_guest_guard(ctx)
-    for name, schema, handler, emoji, group in WORKSPACE_TOOLS:
-        extra = {"guest_guard": _guest_guard(group)} if guests else {}
-        ctx.register_tool(name=name, toolset=WORKSPACE_TOOLSET, schema=schema, handler=handler,
-                          description=schema["description"], emoji=emoji,
-                          check_fn=room_read_tools_enabled, **extra)
-    for name, schema, handler, emoji, group in ROOM_READ_TOOLS:
-        extra = {"guest_guard": _guest_guard(group)} if guests else {}
-        ctx.register_tool(name=name, toolset=ROOM_READ_TOOLSET, schema=schema, handler=handler,
-                          description=schema["description"], emoji=emoji,
-                          check_fn=room_read_tools_enabled, **extra)
-    # Harmless when the tools are off: check_fn drops them before tool_search sees them.
-    pin_visible()
+    for toolset, tools in ((WORKSPACE_TOOLSET, WORKSPACE_TOOLS), (ROOM_READ_TOOLSET, ROOM_READ_TOOLS)):
+        for name, schema, handler, emoji, group in tools:
+            kw = dict(name=name, toolset=toolset, schema=schema, handler=handler,
+                      description=schema["description"], emoji=emoji, check_fn=room_read_tools_enabled)
+            guests = _register_guest_tool(ctx, kw, _guest_guard(group) if guests else None)

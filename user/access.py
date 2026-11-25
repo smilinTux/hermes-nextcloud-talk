@@ -79,6 +79,19 @@ def _norm(uid: Any) -> str:
     return s[len("federated_users/"):] if s.startswith("federated_users/") else s
 
 
+_YAML_WARNED = False
+
+
+def _warn_no_yaml() -> None:
+    global _YAML_WARNED
+    if not _YAML_WARNED:
+        _YAML_WARNED = True
+        logger.warning(
+            "nctalk: PyYAML is not installed; reading the Talk access file with the built-in "
+            "subset parser (block and flow lists, maps, scalars). Install the plugin's declared "
+            "dependency (PyYAML) for full YAML, or write the file as JSON.")
+
+
 def parse(text: str) -> Dict[str, Any]:
     """Parse the file body (YAML when PyYAML is present, else JSON) into a normalized dict."""
     data: Any = None
@@ -86,8 +99,9 @@ def parse(text: str) -> Dict[str, Any]:
         data = json.loads(text)
     else:
         try:
-            import yaml  # type: ignore
+            import yaml  # type: ignore  # declared in plugin.yaml python_dependencies
         except ImportError:  # not every Hermes runtime ships PyYAML
+            _warn_no_yaml()
             data = _mini_yaml(text)
         else:
             data = yaml.safe_load(text)

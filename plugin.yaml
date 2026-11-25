@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.17.2
+version: 1.18.0
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -17,6 +17,8 @@ author: "Hermes Nextcloud Talk contributors"
 # NEXTCLOUD_TALK_ROOM_READ_TOOLS=off. Declared so CLI/TUI processes register them too.
 # tools.guest: lets the room-read tools run for a room guest the access file opens
 # (guest_tools); the operator grants it with plugins.entries.<id>.allow_guest_tools.
+# It is an sk Hermes fork seam (proposed upstream in NousResearch/hermes-agent#160124);
+# on upstream Hermes it grants nothing and the guest tools stay owner-only.
 capabilities:
   - tools.guest
 provides_tools:
@@ -39,6 +41,10 @@ provides_tools:
   - talk_workspace_read
   - talk_workspace_write
   - talk_ask_owner
+# PyYAML reads the Talk access file (user/access.py; a subset parser is the fallback),
+# config.yaml for the nc-live hint (user/livedocs.py) and nc-live-setup (nclive_setup.py).
+python_dependencies:
+  - "PyYAML>=6.0,<7"
 requires_env: []
 optional_env:
   # -- Bot mode --
