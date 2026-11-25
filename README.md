@@ -519,12 +519,24 @@ Install sk-nc-live (see its README) so `sk-nc-live-mcp` is on the gateway's
 `PATH`, then add it to Hermes:
 
 ```
-hermes nctalk nc-live-setup --dry-run   # show the block
-hermes nctalk nc-live-setup             # show it, ask, then write it
+hermes nctalk nc-live-setup --dry-run   # show what it would do
+hermes nctalk nc-live-setup             # do it
 ```
 
-It adds this to the profile's `config.yaml` and never changes an existing
-`nc-live` entry:
+When this Hermes has `hermes mcp add ... --env`, the command runs
+
+```
+hermes mcp add nc-live --command sk-nc-live-mcp --env \
+  'NEXTCLOUD_HOST=${NEXTCLOUD_TALK_SERVER_URL}' \
+  'NEXTCLOUD_USERNAME=${NEXTCLOUD_TALK_USERNAME}' \
+  'NEXTCLOUD_PASSWORD=${NEXTCLOUD_TALK_APP_PASSWORD}'
+```
+
+so Hermes probes the server, lets you pick its tools and writes the entry
+itself (you can also run that line by hand). On an older Hermes, or with
+`--config PATH`, it inserts the block into `config.yaml` as text instead
+(asks first, `--yes` skips the question, keeps comments, writes a backup).
+Either way it never changes an existing `nc-live` entry. The result:
 
 ```yaml
 mcp_servers:
