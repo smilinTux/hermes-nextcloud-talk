@@ -41,6 +41,10 @@ provides_tools:
   - talk_workspace_read
   - talk_workspace_write
   - talk_ask_owner
+# PyYAML reads the Talk access file (user/access.py; a subset parser is the fallback),
+# config.yaml for the nc-live hint (user/livedocs.py) and nc-live-setup (nclive_setup.py).
+python_dependencies:
+  - "PyYAML>=6.0,<7"
 requires_env: []
 optional_env:
   # -- Bot mode --

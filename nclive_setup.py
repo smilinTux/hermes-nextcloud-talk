@@ -43,8 +43,9 @@ class SetupError(Exception):
 def _yaml():
     try:
         import yaml
-    except ImportError as e:  # pragma: no cover - Hermes depends on PyYAML
-        raise SetupError("PyYAML is needed to check config.yaml") from e
+    except ImportError as e:  # declared in plugin.yaml python_dependencies
+        raise SetupError("PyYAML is needed to check config.yaml (pip install 'PyYAML>=6,<7' "
+                         "into the Hermes environment, or reinstall the plugin)") from e
     return yaml
 
 
