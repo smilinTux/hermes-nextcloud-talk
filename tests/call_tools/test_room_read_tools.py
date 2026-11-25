@@ -190,6 +190,50 @@ def test_registration_passes_guards_only_to_a_core_that_takes_them():
     assert guarded["talk_room_files"].__name__ == "nctalk_guest_guard_files"
 
 
+GUEST_TOOLS = {"talk_room_history", "talk_room_threads", "talk_room_files", "talk_workspace_list",
+               "talk_workspace_read", "talk_workspace_write", "talk_ask_owner"}
+
+
+def test_upstream_core_without_guest_guard_registers_every_tool_owner_only():
+    """Upstream Hermes: register_tool has no guest_guard; nothing may crash or be lost."""
+    seen = []
+
+    class UpstreamCore:
+        def register_tool(self, name, toolset, schema, handler, check_fn=None, requires_env=None,
+                          is_async=False, description="", emoji="", override=False):
+            seen.append(name)
+
+    ct.register_tools(UpstreamCore())
+    assert GUEST_TOOLS <= set(seen) and len(seen) == len(set(seen))
+
+
+def test_core_that_advertises_but_rejects_guest_guard_falls_back():
+    """A **kwargs register_tool that raises on the unknown keyword: retry without it."""
+    seen = []
+
+    class Picky:
+        def register_tool(self, name, toolset, schema, handler, check_fn=None, requires_env=None,
+                          is_async=False, description="", emoji="", override=False, guest_guard=None,
+                          **kw):
+            if guest_guard is not None:
+                raise TypeError("register_tool() got an unexpected keyword argument 'guest_guard'")
+            seen.append(name)
+
+    ct.register_tools(Picky())
+    assert GUEST_TOOLS <= set(seen) and len(seen) == len(set(seen))
+
+
+def test_unrelated_type_error_is_not_swallowed():
+    class Broken:
+        def register_tool(self, name, toolset, schema, handler, check_fn=None, requires_env=None,
+                          is_async=False, description="", emoji="", override=False, guest_guard=None):
+            if guest_guard is not None:
+                raise TypeError("schema must be a dict")
+
+    with pytest.raises(TypeError, match="schema"):
+        ct.register_tools(Broken())
+
+
 def test_off_switch(talk, monkeypatch):
     monkeypatch.setenv("NEXTCLOUD_TALK_ROOM_READ_TOOLS", "off")
     assert ct.room_read_tools_enabled() is False

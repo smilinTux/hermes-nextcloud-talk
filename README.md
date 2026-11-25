@@ -142,6 +142,25 @@ rooms:
   is no more than the approver could do anyway.
 - Every write and decision is logged with who asked and who approved.
 
+#### On upstream Hermes: guest grants are inert
+
+The guest features above rely on two seams that exist only in the sk Hermes
+fork today: per-tool guest guards (`register_tool(..., guest_guard=)`, consent
+capability `tools.guest`) and the per-turn owner check
+(`tools.session_scope`). Both are proposed upstream in
+https://github.com/NousResearch/hermes-agent/issues/160124. On upstream
+Hermes the plugin loads and every tool registers, but it fails closed:
+
+- Guest grants do nothing. `guest_tools` in the access file is ignored, and
+  the room-read, workspace and `talk_ask_owner` tools are owner-only.
+- The plugin cannot tell an owner turn from a guest one, so it treats every
+  turn as a guest's: with `approval: required` (the default) even the
+  owner's own `talk_workspace_write` posts an approval request and waits
+  for an approver's thumbs up. Set `approvers:` in the access file, or use
+  `approval: off` in rooms where that is acceptable.
+
+Nothing is opened up by an older or different core; it can only do less.
+
 ## Which mode do I want?
 
 - **Bot mode** if you want a clean, no-personal-account integration that
@@ -453,6 +472,13 @@ speech-to-text, small text files are inlined, other documents, audio and video
 are attached. Only messages the agent answers trigger a download; files in a
 room it is just listening to show up as `[file: name (type)]` in its context.
 The cap is 20 MB per file.
+
+An image link in a reply is fetched and re-uploaded only when it is a public
+http(s) URL: every hop, redirects included, must pass Hermes'
+`tools.url_safety` check (no private, loopback or link-local hosts), and a
+Hermes without that module never fetches (the link is posted as text).
+Local paths are never read for an image link; files the agent produces go
+through Hermes' own file sending.
 
 The agent can send files too. They are uploaded to `Talk/<unique folder>/` in
 the agent account's own Files and shared into the room, so give the account

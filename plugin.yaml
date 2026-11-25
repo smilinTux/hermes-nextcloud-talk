@@ -17,6 +17,8 @@ author: "Hermes Nextcloud Talk contributors"
 # NEXTCLOUD_TALK_ROOM_READ_TOOLS=off. Declared so CLI/TUI processes register them too.
 # tools.guest: lets the room-read tools run for a room guest the access file opens
 # (guest_tools); the operator grants it with plugins.entries.<id>.allow_guest_tools.
+# It is an sk Hermes fork seam (proposed upstream in NousResearch/hermes-agent#160124);
+# on upstream Hermes it grants nothing and the guest tools stay owner-only.
 capabilities:
   - tools.guest
 provides_tools:

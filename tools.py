@@ -1924,6 +1924,26 @@ def _supports_guest_guard(ctx) -> bool:
         return False
 
 
+def _register_guest_tool(ctx, kw: dict, guard) -> bool:
+    """Register one guest-capable tool; returns whether guest guards still look supported.
+
+    ``guest_guard`` is a seam of the sk Hermes fork (proposed upstream in
+    NousResearch/hermes-agent#160124). A core that refuses the keyword gets the tool
+    without it: it then stays owner-only (fail closed), and registration never crashes."""
+    if guard is not None:
+        try:
+            ctx.register_tool(**kw, guest_guard=guard)
+            return True
+        except TypeError as e:
+            if "guest_guard" not in str(e):
+                raise
+            import logging
+            logging.getLogger(__name__).info(
+                "nctalk: this Hermes has no register_tool(guest_guard=); guest tools stay owner-only")
+    ctx.register_tool(**kw)
+    return False
+
+
 def register_tools(ctx) -> None:
     """Register the call tools (``nctalk-calls``, gated on NEXTCLOUD_TALK_CALL_TOOLS) and the
     thread tools (``nctalk-threads``, on in user mode unless NEXTCLOUD_TALK_THREAD_TOOLS=off)."""
@@ -1940,13 +1960,8 @@ def register_tools(ctx) -> None:
         ctx.register_tool(name=name, toolset=CAPS_TOOLSET, schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji, check_fn=server_tools_enabled)
     guests = _supports_guest_guard(ctx)
-    for name, schema, handler, emoji, group in WORKSPACE_TOOLS:
-        extra = {"guest_guard": _guest_guard(group)} if guests else {}
-        ctx.register_tool(name=name, toolset=WORKSPACE_TOOLSET, schema=schema, handler=handler,
-                          description=schema["description"], emoji=emoji,
-                          check_fn=room_read_tools_enabled, **extra)
-    for name, schema, handler, emoji, group in ROOM_READ_TOOLS:
-        extra = {"guest_guard": _guest_guard(group)} if guests else {}
-        ctx.register_tool(name=name, toolset=ROOM_READ_TOOLSET, schema=schema, handler=handler,
-                          description=schema["description"], emoji=emoji,
-                          check_fn=room_read_tools_enabled, **extra)
+    for toolset, tools in ((WORKSPACE_TOOLSET, WORKSPACE_TOOLS), (ROOM_READ_TOOLSET, ROOM_READ_TOOLS)):
+        for name, schema, handler, emoji, group in tools:
+            kw = dict(name=name, toolset=toolset, schema=schema, handler=handler,
+                      description=schema["description"], emoji=emoji, check_fn=room_read_tools_enabled)
+            guests = _register_guest_tool(ctx, kw, _guest_guard(group) if guests else None)
