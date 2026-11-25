@@ -57,6 +57,13 @@ rooms:
   abcd1234: {users: [carol], only: false}     # extra people in one room
 ```
 
+The plugin hands the gateway the same list through its own adapter config
+(`extra.allowed_users`), never through the process environment, which a
+multi-profile gateway shares. The gateway reads an env allowlist first, so
+with an access file leave `NEXTCLOUD_TALK_ALLOWED_USERS` and
+`NEXTCLOUD_TALK_ALLOW_ALL_USERS` unset; the plugin logs a warning when one is
+set and would refuse or admit someone the file does not.
+
 #### Guest read tools (v1.16.0)
 
 Someone allowed in only one room (like `carol` above) is a guest: Hermes runs

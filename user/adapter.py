@@ -2810,21 +2810,43 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         return self._access.allowed(user_id, room)
 
     def _sync_gateway_allowlist(self) -> None:
-        """With an access file, hand the gateway the same list.
+        """With an access file, hand the gateway the same list, through THIS adapter only.
 
-        The adapter gates at intake; the gateway's own check is the second
-        line. It reads ``NEXTCLOUD_TALK_ALLOWED_USERS`` live (or, with no env
-        list, this adapter's ``extra.allowed_users``), so both are updated.
+        The adapter gates at intake; the gateway's own check is the second line. With
+        no ``NEXTCLOUD_TALK_ALLOWED_USERS`` in the environment it reads the live
+        adapter's ``extra.allowed_users``, which is updated here. The process
+        environment is never written: in a multi-profile gateway it is shared, and a
+        write would change another profile's allowlist.
         """
         if self._access.source != "file":
             return
         ids = ",".join(self._access.gateway_ids())
-        os.environ["NEXTCLOUD_TALK_ALLOWED_USERS"] = ids
-        os.environ["NEXTCLOUD_TALK_ALLOW_ALL_USERS"] = "false"
         extra = getattr(self.config, "extra", None)
         if isinstance(extra, dict):
             extra["allowed_users"] = ids
             extra["allow_all_users"] = False
+        self._warn_env_shadows_file(ids)
+
+    def _warn_env_shadows_file(self, ids: str) -> None:
+        """An env allowlist takes precedence in the gateway's check, so with one set
+        the access file's later additions would be refused there. Say so, once per change."""
+        env_users = _parse_allowlist(os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", ""))
+        env_all = _truthy(os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", ""))
+        missing = sorted(set(_parse_allowlist(ids)) - env_users) if env_users else []
+        key = (tuple(missing), env_all)
+        if key == getattr(self, "_env_shadow_warned", None):
+            return
+        self._env_shadow_warned = key
+        if missing:
+            logger.warning(
+                "[%s] Access file in use but NEXTCLOUD_TALK_ALLOWED_USERS is also set; the gateway "
+                "reads the env list first, so these access-file users will be refused there: %s. "
+                "Unset NEXTCLOUD_TALK_ALLOWED_USERS when using an access file.",
+                self.name, ", ".join(missing))
+        if env_all:
+            logger.warning(
+                "[%s] Access file in use but NEXTCLOUD_TALK_ALLOW_ALL_USERS is set; the plugin still "
+                "gates on the file, but unset it so the gateway does not admit everyone.", self.name)
 
     async def _dispatch_watch_digest(self, token: str, events: List[MessageEvent]) -> None:
         """Send one watch-mode digest as an ordinary inbound event.
